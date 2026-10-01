@@ -16,6 +16,7 @@ What it does for you:
 - **Training best practices built in** — early stopping, checkpoint of the best epoch (reloaded at the end), class weights, training-history plots.
 - **Reproducibility and model versioning** — every training run is saved as a self-describing, timestamped set of files (model, scalers, data, hyperparameters, history) and restored with one call (see [Model versioning](#model-versioning-runs-datasets-and-hyperparameters)).
 - **Evaluation and use** — classification reports per output, precision/recall vs probability cutoff, gradient-based feature importance, ready-to-use prediction on new data with automatic scaling/descaling.
+- **TensorFlow or PyTorch** — choose the framework when creating the instance (`backend = 'tensorflow'` or `'torch'`); the same code, files and results work with both, and a model trained with one backend can be reloaded with the other.
 - **One workflow for two model families** — `fastLSTM` shares parameter names, method names and saved-file layout with its sister package [`fastANN`](https://github.com/fede72bari/fastANN) (dense networks): the same code pattern trains, saves and reloads both, so they can be compared on the same data.
 
 Typical uses: price/return forecasting, direction (up/down) classification, multi-horizon forecasts, any sequence-to-value problem on tabular time series.
@@ -59,16 +60,18 @@ Python 3.9+ and:
 
 | Purpose | Packages |
 |---|---|
-| Core | `tensorflow` (2.x, Keras 3 supported), `scikit-learn`, `pandas`, `numpy`, `scipy`, `joblib` |
+| Core | `keras` 3 with **one** backend: `tensorflow` (2.16+) **or** `torch`; `scikit-learn`, `pandas`, `numpy`, `scipy`, `joblib` |
 | Plots and notebooks | `matplotlib`, `plotly`, `ipython` |
 | Imported by the module (shared toolbox) | `xgboost`, `seaborn`, `tabulate`, `statsmodels`, `imbalanced-learn`, `deap`, `yfinance`, `pytz` |
 
 ```bash
-pip install tensorflow scikit-learn pandas numpy scipy joblib matplotlib plotly ipython \
+pip install scikit-learn pandas numpy scipy joblib matplotlib plotly ipython \
             xgboost seaborn tabulate statsmodels imbalanced-learn deap yfinance pytz
+pip install tensorflow          # TensorFlow backend (includes Keras 3)
+pip install keras torch         # PyTorch backend (TensorFlow is then optional)
 ```
 
-Tested with TensorFlow 2.21, pandas 3.0, NumPy 2.4, scikit-learn 1.9, SciPy 1.17 and Plotly 7.
+Tested with Keras 3.15 on TensorFlow 2.21 and on PyTorch 2.14, pandas 3.0, NumPy 2.4, scikit-learn 1.9, SciPy 1.17 and Plotly 7.
 
 ---
 
@@ -145,6 +148,21 @@ lstm.output_column_names()
 
 It works for regressors (next `k` values) and classificators (e.g. "will it go up at step 1, 2, 3?"). The last `k - 1` rows of each set have no complete future and are not used as samples. With `steps_ahead = 1` (default) there is one output per target column.
 
+### Choosing TensorFlow or PyTorch
+
+The network is written with Keras 3, which runs on top of TensorFlow or PyTorch. Choose the backend when you create the first instance:
+
+```python
+model = fastLSTM(X_data = X_df, Y_data = Y_df, backend = 'torch')       # or 'tensorflow'
+print(model.backend)                                               # 'torch'
+```
+
+- `backend = None` (default) uses the backend already active, or the `KERAS_BACKEND` environment variable, or `'tensorflow'`.
+- Keras uses **one backend per Python process**: the first instance fixes it. Asking for a different one later raises a clear error; restart the kernel to switch.
+- Saved models are portable: a model trained with TensorFlow can be reloaded with PyTorch and vice versa (`load_all` reloads the weights and recompiles the network with the saved loss, metrics and learning rate).
+- With PyTorch, create the first instance (or `import torch`) **before** anything that imports TensorFlow: with some TensorFlow/PyTorch builds, loading the Keras PyTorch backend after TensorFlow crashes Python.
+- `model.keras` is the Keras module in use; `model.model` is a regular Keras model on either backend.
+
 ### Split and scaling
 
 - The split is always **sequential** (first `train_size_rate` of the rows for training, the rest for test) to avoid look-ahead.
@@ -215,6 +233,7 @@ It works for regressors (next `k` values) and classificators (e.g. "will it go u
 |---|---|---|---|
 | `data_storage_path` | `str` | `'\\cyPredict\\'` | Folder for every saved file; it is concatenated to file names, so it **must end with a separator** (`'./models/'`). |
 | `model_name` | `str` | `'LSTM'` | Name used in every saved file name. |
+| `backend` | `'tensorflow'`, `'torch'` | `None` | Framework that runs the network (see [Choosing TensorFlow or PyTorch](#choosing-tensorflow-or-pytorch)). |
 
 ---
 

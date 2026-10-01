@@ -11,7 +11,8 @@ package ``fastANN`` so that the same keyword-argument workflow works with
 both. Only the parameters and methods that make sense just for recurrent
 networks (``LSTM_type``, ``timesteps``, ``steps_ahead``, ``class_weight``,
 ``create_generators``, ``create_sequences``, ``prepare_input_sample``) are
-LSTM-specific. fastANN options not available here: the pre-split
+LSTM-specific. The network runs on TensorFlow or PyTorch (Keras 3 backends),
+chosen with the ``backend`` parameter. fastANN options not available here: the pre-split
 ``X_train_s`` / ``Y_train`` / ``X_test_s`` / ``Y_test`` inputs, ``split_type``
 (the split is always sequential) and ``autoencoder_mode``.
 
@@ -37,6 +38,7 @@ Typical workflow
 import multiprocessing
 
 # Files Management
+import sys
 import gzip
 import joblib
 import glob
@@ -111,17 +113,7 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
-import tensorflow as tensorflow
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Dense
-from tensorflow.keras.layers import Dropout
-from tensorflow.keras.layers import LSTM, Input
-from tensorflow.keras.layers import BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, LearningRateScheduler, LambdaCallback
-from tensorflow import keras
-from tensorflow.keras.preprocessing.sequence import TimeseriesGenerator
-from tensorflow.keras.optimizers import SGD
-from tensorflow.keras.losses import BinaryCrossentropy, CategoricalCrossentropy, SparseCategoricalCrossentropy
+# Keras (TensorFlow or PyTorch backend) is loaded by load_keras, below
 
 
 # Optimization
@@ -148,6 +140,139 @@ import yfinance as yf
 
 # Financial indicators
 # import talib
+
+
+# ---------------------------------------------------------------------------
+#                    Deep learning backend (TensorFlow or PyTorch)
+# ---------------------------------------------------------------------------
+
+# The network is written with Keras 3, which runs on top of TensorFlow or
+# PyTorch. Keras fixes its backend when it is first imported, so it is NOT
+# imported here: it is loaded by the first instance created, with the backend
+# requested by its `backend` parameter (see load_keras).
+SUPPORTED_BACKENDS = ('tensorflow', 'torch')
+
+
+def load_keras(backend = None):
+    """
+    Import Keras 3 with the requested backend and return the module.
+
+    Keras uses one backend per Python process: the first call (usually the
+    first fastLSTM / fastANN instance) fixes it; later calls must ask for the
+    same backend or for ``None``.
+
+    Parameters
+    ----------
+    backend : {'tensorflow', 'torch'}, optional
+        Backend to use. ``None`` keeps the active one, or, if Keras is not
+        loaded yet, uses the ``KERAS_BACKEND`` environment variable
+        (``'tensorflow'`` when it is not set).
+
+    Returns
+    -------
+    module
+        The ``keras`` module.
+
+    Raises
+    ------
+    ValueError
+        If ``backend`` is not supported.
+    RuntimeError
+        If Keras is already running in this process with another backend
+        (restart the Python kernel to change it).
+
+    Examples
+    --------
+    >>> keras = load_keras('torch')
+    >>> keras.backend.backend()
+    'torch'
+    """
+    if((backend is not None) and (backend not in SUPPORTED_BACKENDS)):
+        raise ValueError(f"backend must be one of {SUPPORTED_BACKENDS}, not '{backend}'.")
+
+    if('keras' not in sys.modules):
+        if(backend is not None):
+            os.environ['KERAS_BACKEND'] = backend
+
+        if((os.environ.get('KERAS_BACKEND', 'tensorflow') == 'torch') and ('tensorflow' in sys.modules)):
+            # with some TensorFlow/PyTorch builds, loading the Keras torch backend after TensorFlow crashes Python
+            warnings.warn("TensorFlow is already imported in this process: if Python crashes while loading the "
+                          "PyTorch backend, create the first fastLSTM/fastANN instance (or import torch) before "
+                          "anything that imports TensorFlow.",
+                          RuntimeWarning,
+                          stacklevel = 3)
+
+        import keras
+
+    keras = sys.modules['keras']
+    active_backend = keras.backend.backend()
+
+    if((backend is not None) and (active_backend != backend)):
+        raise RuntimeError(f"Keras is already using the '{active_backend}' backend in this Python process and it "
+                           f"cannot be changed safely: restart the kernel to use '{backend}', or create the instance "
+                           f"with backend = '{active_backend}' (or None).")
+
+    return keras
+
+
+def make_sequence_generator(keras, data, targets, length, batch_size, end_index = None):
+    """
+    Batches of (sequence, target) samples for Keras, on any backend.
+
+    Same pairing as Keras' former ``TimeseriesGenerator``: target row ``t`` is
+    paired with the data rows ``t - length ... t - 1``, for
+    ``t = length ... end_index``, in chronological order (no shuffling).
+
+    Parameters
+    ----------
+    keras : module
+        The Keras module (see :func:`load_keras`).
+    data : numpy.ndarray
+        Features, shape ``(n_rows, n_features)``.
+    targets : numpy.ndarray
+        Targets, shape ``(n_rows, n_outputs)``.
+    length : int
+        Number of rows of each sequence (``timesteps``).
+    batch_size : int
+        Number of samples per batch.
+    end_index : int, optional
+        Last target row used (inclusive); defaults to the last row.
+
+    Returns
+    -------
+    keras.utils.PyDataset
+        Object with ``len(generator)`` batches; ``generator[i]`` returns
+        ``(X_batch, Y_batch)`` with ``X_batch`` of shape
+        ``(batch, length, n_features)``.
+
+    Raises
+    ------
+    ValueError
+        If there are no samples (not enough rows for ``length``).
+    """
+    data = np.asarray(data, dtype = np.float32)
+    targets = np.asarray(targets, dtype = np.float32)
+    last_index = len(data) - 1 if end_index is None else end_index
+
+    if(length > last_index):
+        raise ValueError(f'Not enough rows: sequences of {length} rows need at least {length + 1} rows '
+                         f'(last usable target row is {last_index}).')
+
+    # the class is defined here, on the Keras module currently loaded, so that Keras recognises it
+    class SequenceGenerator(keras.utils.PyDataset):
+
+        def __len__(self):
+            return (last_index - length + batch_size) // batch_size
+
+        def __getitem__(self, index):
+            if(index < 0):
+                index += len(self)
+            rows = np.arange(length + index * batch_size, min(length + (index + 1) * batch_size, last_index + 1))
+            # sample for target row r: the `length` rows before r
+            X_batch = np.stack([data[row - length:row] for row in rows])
+            return X_batch, targets[rows]
+
+    return SequenceGenerator()
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +321,9 @@ class fastLSTM:
 
     How samples are built
     ---------------------
-    Training and validation samples are created by Keras'
-    ``TimeseriesGenerator`` with ``length = timesteps``: the target row ``t``
+    Training and validation samples are created by a sequence generator
+    (:func:`make_sequence_generator`, same behaviour as Keras' former
+    ``TimeseriesGenerator``) with ``length = timesteps``: the target row ``t``
     is paired with the feature rows ``t - timesteps ... t - 1`` (row ``t``
     itself is NOT part of the window). If ``Y_data`` row ``t`` already holds
     the future value to predict for the bar ``t``, take this into account
@@ -308,6 +434,13 @@ class fastLSTM:
         unbalanced classes during training. Meaningful with a single output
         (one binary target, ``steps_ahead = 1``): with more outputs Keras
         applies it to the argmax of each target row.
+    backend : {'tensorflow', 'torch'}, optional
+        Deep learning framework that runs the network (through Keras 3).
+        ``None`` (default) keeps the backend already active in the Python
+        process, or uses the ``KERAS_BACKEND`` environment variable
+        (``'tensorflow'`` when it is not set). The backend is fixed for the
+        whole process by the first instance: to change it restart the kernel.
+        Saved models can be reloaded with either backend.
     **legacy_kwargs
         Old parameter names, still accepted for backward compatibility with
         a ``DeprecationWarning``: ``scaler`` (-> ``scaler_type``), ``metric``
@@ -319,6 +452,10 @@ class fastLSTM:
 
     Attributes
     ----------
+    backend : str
+        Active Keras backend (``'tensorflow'`` or ``'torch'``).
+    keras : module
+        The Keras module used by the instance.
     model : keras.Sequential
         The network (rebuilt by :meth:`network_structure_set_compile`,
         replaced by the saved checkpoint after :meth:`network_training`).
@@ -332,7 +469,7 @@ class fastLSTM:
         Scaled features.
     Y_train_s, Y_test_s : numpy.ndarray
         Targets used for training (scaled only when ``scale_targets = True``).
-    generator, validation_generator : TimeseriesGenerator
+    generator, validation_generator : keras.utils.PyDataset
         Training and validation sample generators.
     loss_df : pandas.DataFrame
         Training history (one row per epoch).
@@ -400,6 +537,7 @@ class fastLSTM:
                  timesteps = 1,
                  steps_ahead = 1,
                  class_weight = None,
+                 backend = None,
                  **legacy_kwargs):
 
         # old parameter names (fastLSTM < fastANN alignment) override the defaults
@@ -412,7 +550,12 @@ class fastLSTM:
         early_stop_mode = legacy_values.get('early_stop_mode', early_stop_mode)
         scale_targets = legacy_values.get('scale_targets', scale_targets)
 
-        self.model = Sequential()
+        # Keras with the requested backend (fixed for the whole Python process by the first instance)
+        self.keras = load_keras(backend)
+        self.backend = self.keras.backend.backend()
+        print(f'Keras backend: {self.backend}')
+
+        self.model = self.keras.Sequential()
         self.save_best_only = save_best_only
 
         self.data_storage_path = data_storage_path
@@ -639,7 +782,9 @@ class fastLSTM:
                                'LSTM_type': self.LSTM_type,
                                'timesteps': self.timesteps,
                                'steps_ahead': self.steps_ahead,
-                               'class_weight': class_weight
+                               'class_weight': class_weight,
+                               # informative: saved models can be reloaded with either backend
+                               'backend': self.backend
                               }
 
 
@@ -807,11 +952,11 @@ class fastLSTM:
         if(loss_key is None):
             self.loss_function = loss
         elif('sparsecategoricalcrossentropy' in loss_key):
-            self.loss_function = SparseCategoricalCrossentropy()
+            self.loss_function = self.keras.losses.SparseCategoricalCrossentropy()
         elif('categoricalcrossentropy' in loss_key):
-            self.loss_function = CategoricalCrossentropy()
+            self.loss_function = self.keras.losses.CategoricalCrossentropy()
         elif('binarycrossentropy' in loss_key):
-            self.loss_function = BinaryCrossentropy()
+            self.loss_function = self.keras.losses.BinaryCrossentropy()
         else:
             self.loss_function = loss
 
@@ -840,7 +985,7 @@ class fastLSTM:
         if(patience is not None):
             self.early_stop_patience = patience
 
-        self.early_stop = EarlyStopping(monitor = self.early_stop_monitor_metric,
+        self.early_stop = self.keras.callbacks.EarlyStopping(monitor = self.early_stop_monitor_metric,
                                         mode = self.early_stop_mode,
                                         verbose = 1,
                                         patience = self.early_stop_patience)
@@ -876,7 +1021,7 @@ class fastLSTM:
 
         # the callback is stored in its own attribute: assigning it to self.checkpoint_callback
         # would shadow this method and make a second training fail
-        self.model_checkpoint = ModelCheckpoint(self.data_storage_path + model_file_name,
+        self.model_checkpoint = self.keras.callbacks.ModelCheckpoint(self.data_storage_path + model_file_name,
                                                 monitor = self.checkpoint_monitor_metric,
                                                 mode = self.checkpoint_mode,
                                                 verbose = 1,
@@ -936,11 +1081,13 @@ class fastLSTM:
         n_features = self.X_train_s.shape[1]
         n_hidden_layers = len(self.model_relative_width)
 
+        keras = self.keras
+
         # reset
-        self.model = Sequential()
+        self.model = keras.Sequential()
 
         # input layer: sequences of `timesteps` rows with `n_features` columns
-        self.model.add(Input(shape = (self.timesteps, n_features)))
+        self.model.add(keras.Input(shape = (self.timesteps, n_features)))
 
         # hidden layers
         for i in range(n_hidden_layers):
@@ -956,11 +1103,11 @@ class fastLSTM:
             print(f'Hidden LSTM layer {i + 1}/{n_hidden_layers}: relative width {model_relative_width}, '
                   f'dropout {model_dropout}, return_sequences {return_sequences}')
 
-            self.model.add(LSTM(units = int(n_features * model_relative_width),
+            self.model.add(keras.layers.LSTM(units = int(n_features * model_relative_width),
                                 return_sequences = return_sequences,
                                 activation = self.activation))
 
-            self.model.add(Dropout(model_dropout))
+            self.model.add(keras.layers.Dropout(model_dropout))
 
         # output layer
         # output layer: one unit per target column and per step ahead (see output_column_names)
@@ -968,13 +1115,13 @@ class fastLSTM:
 
         if(self.LSTM_type == 'classificator'):
             print(f'Output layer for classification: {n_outputs} neurons and activation = {self.last_layer_activation}')
-            self.model.add(Dense(n_outputs,
-                                 activation = self.last_layer_activation))
+            self.model.add(keras.layers.Dense(n_outputs,
+                                              activation = self.last_layer_activation))
 
         elif(self.LSTM_type == 'regressor'):
             # linear output: last_layer_activation is not used by regressors
             print(f'Output layer for regression: {n_outputs} neurons and linear activation')
-            self.model.add(Dense(n_outputs, activation = 'linear'))
+            self.model.add(keras.layers.Dense(n_outputs, activation = 'linear'))
 
         if((self.class_weight is not None) and (n_outputs > 1)):
             warnings.warn('With more than one output Keras applies class_weight to the argmax of each target row '
@@ -983,7 +1130,7 @@ class fastLSTM:
                           stacklevel = 2)
 
         # compile
-        self.model.compile(optimizer = tensorflow.keras.optimizers.Adam(learning_rate = self.learning_rate),
+        self.model.compile(optimizer = keras.optimizers.Adam(learning_rate = self.learning_rate),
                            loss = self.loss_function,
                            metrics = self.metrics)
 
@@ -1073,7 +1220,7 @@ class fastLSTM:
         """
         Create the training and validation sample generators.
 
-        ``TimeseriesGenerator`` pairs target row ``t`` with the feature rows
+        The generators (:func:`make_sequence_generator`) pair target row ``t`` with the feature rows
         ``t - timesteps ... t - 1``; with ``steps_ahead > 1`` the target of
         the sample is ``Y[t], ..., Y[t + steps_ahead - 1]`` (see
         :meth:`make_multi_step_targets`). Each generator yields
@@ -1101,16 +1248,18 @@ class fastLSTM:
             self.batch_size = batch_size
 
         # the last target row usable is the one that still has steps_ahead - 1 rows after it
-        self.generator = TimeseriesGenerator(self.X_train_s,
-                                             self.make_multi_step_targets(self.Y_train_s),
-                                             length = self.timesteps,
-                                             end_index = len(self.X_train_s) - self.steps_ahead,
-                                             batch_size = self.batch_size)
-        self.validation_generator = TimeseriesGenerator(self.X_test_s,
-                                                        self.make_multi_step_targets(self.Y_test_s),
-                                                        length = self.timesteps,
-                                                        end_index = len(self.X_test_s) - self.steps_ahead,
-                                                        batch_size = self.batch_size)
+        self.generator = make_sequence_generator(self.keras,
+                                                 self.X_train_s,
+                                                 self.make_multi_step_targets(self.Y_train_s),
+                                                 length = self.timesteps,
+                                                 end_index = len(self.X_train_s) - self.steps_ahead,
+                                                 batch_size = self.batch_size)
+        self.validation_generator = make_sequence_generator(self.keras,
+                                                            self.X_test_s,
+                                                            self.make_multi_step_targets(self.Y_test_s),
+                                                            length = self.timesteps,
+                                                            end_index = len(self.X_test_s) - self.steps_ahead,
+                                                            batch_size = self.batch_size)
 
 
     def network_training(self, epochs, batch_size = None, timesteps = None):
@@ -1190,7 +1339,7 @@ class fastLSTM:
         else:
             print(f'Batch size is none, keep default or previous value {self.batch_size}')
 
-        # training and validation samples, built before writing any file: TimeseriesGenerator raises here
+        # training and validation samples, built before writing any file: the generators raise here
         # if a set has no more than `timesteps` rows
         self.create_generators()
 
@@ -1332,6 +1481,12 @@ class fastLSTM:
         """
         Load a saved Keras model into ``self.model``.
 
+        The model can have been trained with either backend. It is loaded
+        without its saved compile state and recompiled with the current
+        ``loss``, ``metrics`` and ``learning_rate`` (restored from the
+        hyperparameters by :meth:`load_all`), so a further training starts
+        with a fresh optimizer state.
+
         Parameters
         ----------
         model_file_name : str, optional
@@ -1362,7 +1517,13 @@ class fastLSTM:
             print("Error: Model file does not exist.")
 
         print(f'\nTrying to load model {model_file_path}')
-        self.model = load_model(model_file_path)
+        # compile = False: the saved compile configuration can refer to backend-specific classes (e.g. the PyTorch
+        # Adam optimizer) that cannot be loaded with the other backend. Architecture and weights are portable, so the
+        # model is loaded without it and recompiled with the current loss, metrics and learning rate.
+        self.model = self.keras.models.load_model(model_file_path, compile = False)
+        self.model.compile(optimizer = self.keras.optimizers.Adam(learning_rate = self.learning_rate),
+                           loss = self.loss_function,
+                           metrics = self.metrics)
         print(f'Model loaded.')
 
         if self.model:
@@ -1673,7 +1834,7 @@ class fastLSTM:
         """
         Split a time series into overlapping windows (sliding window, step 1).
 
-        Utility not used internally (training uses ``TimeseriesGenerator``).
+        Utility not used internally (training uses :meth:`create_generators`).
 
         Parameters
         ----------
@@ -1774,7 +1935,7 @@ class fastLSTM:
 
         else:
             print('Target not scaled')
-            # numpy arrays (not DataFrames): TimeseriesGenerator indexes the targets by row position
+            # numpy arrays (not DataFrames): the generators index the targets by row position
             self.Y_train_s = self.Y_train.values
             self.Y_test_s = self.Y_test.values
 
@@ -1983,27 +2144,42 @@ class fastLSTM:
         """
         Gradient of the mean squared error with respect to the network inputs.
 
+        Works with both backends (TensorFlow ``GradientTape`` or PyTorch
+        autograd).
+
         Parameters
         ----------
-        inputs : tensorflow.Tensor
+        inputs : numpy.ndarray
             Input sequences, shape ``(n_samples, timesteps, n_features)``.
-        targets : tensorflow.Tensor
+        targets : numpy.ndarray
             Targets, shape ``(n_samples, n_outputs)``.
 
         Returns
         -------
-        tensorflow.Tensor
+        numpy.ndarray
             Gradients with the same shape as ``inputs``.
         """
+        keras = self.keras
+
+        # MSE is used for every network type (as in fastANN): only the gradient magnitude matters here
+        mse = keras.losses.MeanSquaredError()
+        targets = keras.ops.convert_to_tensor(np.asarray(targets, dtype = np.float32))
+
+        if(self.backend == 'torch'):
+            # PyTorch autograd: the inputs become a leaf tensor that records its gradient
+            inputs = keras.ops.convert_to_tensor(np.asarray(inputs, dtype = np.float32))
+            inputs.requires_grad_(True)
+            loss = mse(targets, self.model(inputs))
+            loss.backward()
+            return inputs.grad.detach().cpu().numpy()
+
+        import tensorflow
+        inputs = tensorflow.convert_to_tensor(np.asarray(inputs, dtype = np.float32))
         with tensorflow.GradientTape() as tape:
             tape.watch(inputs)
-            predictions = self.model(inputs)
+            loss = mse(targets, self.model(inputs))
 
-            # MSE is used for every network type (as in fastANN): only the gradient magnitude matters here
-            mse = tensorflow.keras.losses.MeanSquaredError()
-            loss = mse(targets, predictions)
-
-        return tape.gradient(loss, inputs)
+        return tape.gradient(loss, inputs).numpy()
 
 
     def gradient_feature_importance(self, feature_names = None):
@@ -2042,13 +2218,13 @@ class fastLSTM:
 
         # all the test sequences and their targets, exactly as seen during validation
         batches = [self.validation_generator[i] for i in range(len(self.validation_generator))]
-        X_tensor = tensorflow.convert_to_tensor(np.concatenate([batch[0] for batch in batches]), dtype=tensorflow.float32)
-        Y_tensor = tensorflow.convert_to_tensor(np.concatenate([batch[1] for batch in batches]), dtype=tensorflow.float32)
+        X_test_sequences = np.concatenate([batch[0] for batch in batches])
+        Y_test_sequences = np.concatenate([batch[1] for batch in batches])
 
-        gradients = self.compute_gradients(X_tensor, Y_tensor)
+        gradients = self.compute_gradients(X_test_sequences, Y_test_sequences)
 
         # average over samples and timesteps: one value per feature
-        feature_importance = np.mean(np.abs(gradients.numpy()), axis=(0, 1))
+        feature_importance = np.mean(np.abs(gradients), axis=(0, 1))
 
         feature_importance = feature_importance / np.sum(feature_importance)
 
