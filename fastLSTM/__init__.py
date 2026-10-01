@@ -202,7 +202,9 @@ class fastLSTM:
     itself is NOT part of the window). If ``Y_data`` row ``t`` already holds
     the future value to predict for the bar ``t``, take this into account
     when building ``Y_data``. As a consequence the first ``timesteps`` rows of
-    the test set have no prediction.
+    the test set have no prediction. With ``steps_ahead = k > 1`` the sample
+    is trained on target rows ``t ... t + k - 1`` at once, so the last
+    ``k - 1`` rows of each set are not used as samples either.
 
     Parameters
     ----------
@@ -1607,12 +1609,24 @@ class fastLSTM:
         Deprecated alias of :meth:`network_predictions_evaluation`.
 
         Kept for backward compatibility with the return values of the old
-        method: ``(filtered_predictions_results_df, report)`` when
-        ``output_dict = True``. With ``output_dict = False`` it returns
-        ``(filtered_predictions_results_df, predictions_df)`` (the old method
-        returned the ``classification_report`` function by mistake). New code
-        should use :meth:`network_predictions_evaluation`, which returns
-        ``predictions_df`` too.
+        method. New code should use :meth:`network_predictions_evaluation`,
+        which returns ``predictions_df`` too.
+
+        Parameters
+        ----------
+        min_probability : float
+            Threshold (0 - 1): predictions strictly greater than it become 1.
+        output_dict : bool, default False
+            If ``True`` the report is also returned as a dictionary.
+
+        Returns
+        -------
+        tuple
+            ``(filtered_predictions_results_df, report)`` when
+            ``output_dict = True`` (old contract);
+            ``(filtered_predictions_results_df, predictions_df)`` otherwise
+            (the old method returned the ``classification_report`` function
+            by mistake).
         """
         warnings.warn("binary_network_predictions_evaluation is deprecated, use network_predictions_evaluation instead.",
                       DeprecationWarning,
@@ -1874,7 +1888,9 @@ class fastLSTM:
         During training the window paired with target row ``t`` ends at row
         ``t - 1`` (see :meth:`create_generators`); so the prediction made on
         the window ending at ``current_datetime_idx`` corresponds to the
-        target row ``current_datetime_idx + 1``.
+        target row ``current_datetime_idx + 1`` (and, with
+        ``steps_ahead = k``, to rows ``current_datetime_idx + 1 ...
+        current_datetime_idx + k``).
 
         Examples
         --------
