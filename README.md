@@ -5,6 +5,7 @@
 ### What is fastLSTM?
 `fastLSTM` is a structured framework designed to simplify the creation and training of Long Short-Term Memory (LSTM) models for both classification and regression tasks. Unlike manual LSTM model construction in TensorFlow/Keras, `fastLSTM` streamlines the process by automating key aspects such as:
 - **Data structuring with generators**: Automatically aligns `timesteps` to match input-output sequences.
+- **Multi-step forecasting**: `steps_ahead` predicts the next `k` values of every target at once.
 - **Optimized model architecture**: Correctly initializes the first and last layers, avoiding common issues in LSTM design.
 - **Scalability and data preprocessing**: Integrates automated scaling and dataset splitting.
 
@@ -37,7 +38,7 @@ Parameter names, method names and saved files follow the sister package `fastANN
 | `scale_targets`            | If `True` targets are scaled too and `model_predict` can descale predictions. |
 | `train_size_rate`          | Fraction of rows used for training (default `0.7`); the split is always sequential. |
 | `timesteps`                | Number of past rows in each input sequence. |
-| `steps_ahead`              | Output-units multiplier for regressors. Targets are not shifted automatically: keep `1` and, to forecast several steps, put the future values as separate `Y_data` columns. |
+| `steps_ahead`              | Number of consecutive future steps predicted for each target (classificators and regressors). With `steps_ahead = k` each sample is trained on the next `k` target rows and the network has `n_targets * k` outputs, named by `output_column_names()` (e.g. `up_step_1`, `up_step_2`, ...). |
 | `save_X_Y_data`            | If `True` (default) `X_data` and `Y_data` are saved with the model. |
 
 ### Training Parameters
@@ -179,6 +180,9 @@ Precision and recall of class `1` for cutoffs from `n_points / 100` to `0.99`.
 
 ### `gradient_feature_importance(feature_names=None)`
 Gradient-based feature importance on the test set.
+
+### `output_column_names()`
+Names of the prediction columns: the target names, or `<target>_step_<k>` when `steps_ahead > 1` (all targets of step 1, then step 2, ...).
 
 ### `plot_training_history()`
 Plots the training history columns listed in `history_metrics`.

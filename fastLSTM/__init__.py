@@ -225,8 +225,8 @@ class fastLSTM:
         Dropout rate (0 - 1) applied after each hidden LSTM layer. Must have
         the same length as ``model_relative_width``.
     LSTM_type : {'classificator', 'regressor'}, default 'classificator'
-        * ``'classificator'``: output layer with one unit per target column
-          and ``last_layer_activation``.
+        * ``'classificator'``: output layer with ``n_targets * steps_ahead``
+          units and ``last_layer_activation``.
         * ``'regressor'``: output layer with ``n_targets * steps_ahead`` units
           and linear activation (``last_layer_activation`` is ignored).
     learning_rate : float, default 0.0003
@@ -238,7 +238,8 @@ class fastLSTM:
     last_layer_activation : str, default 'sigmoid'
         Activation of the output layer for ``'classificator'`` networks:
         ``'sigmoid'`` for independent binary targets, ``'softmax'`` for
-        one-hot multi-class targets.
+        one-hot multi-class targets (only with ``steps_ahead = 1``: softmax
+        would normalise across all steps).
     loss : str or keras.losses.Loss, default 'binary_crossentropy'
         Loss function. Any Keras loss name (``'binary_crossentropy'``,
         ``'categorical_crossentropy'``, ``'mse'``, ``'mae'``, ...) or a Keras
@@ -292,16 +293,19 @@ class fastLSTM:
         Length of the input sequences (number of past rows seen by the
         network for each prediction).
     steps_ahead : int, default 1
-        Multiplier of the output units of ``'regressor'`` networks (units =
-        n_target_columns * steps_ahead). Targets are NOT shifted
-        automatically: each sample still has n_target_columns values, so
-        with the built-in Keras losses keep 1 (with several target columns a
-        larger value raises a shape error, with a single column the target is
-        silently broadcast to every output unit). To forecast several steps,
-        put the future values as separate ``Y_data`` columns.
+        Number of consecutive future steps predicted for each target, for
+        both classificators and regressors. With ``steps_ahead = k`` the
+        network has ``n_targets * k`` outputs and each sample is trained on
+        ``Y[t], Y[t + 1], ..., Y[t + k - 1]`` (``Y[t]`` being the row right
+        after the input window). Outputs are step-major and named by
+        :meth:`output_column_names` (e.g. ``'up_step_1'``, ``'up_step_2'``).
+        The last ``k - 1`` rows of the training and test sets have no
+        complete future and are not used as samples.
     class_weight : dict, optional
         Keras class weights, e.g. ``{0: 1.0, 1: 3.0}``, to rebalance
-        unbalanced classes during training.
+        unbalanced classes during training. Meaningful with a single output
+        (one binary target, ``steps_ahead = 1``): with more outputs Keras
+        applies it to the argmax of each target row.
     **legacy_kwargs
         Old parameter names, still accepted for backward compatibility with
         a ``DeprecationWarning``: ``scaler`` (-> ``scaler_type``), ``metric``
@@ -957,15 +961,24 @@ class fastLSTM:
             self.model.add(Dropout(model_dropout))
 
         # output layer
+        # output layer: one unit per target column and per step ahead (see output_column_names)
+        n_outputs = self.Y_train.shape[1] * self.steps_ahead
+
         if(self.LSTM_type == 'classificator'):
-            print(f'Output layer for classification: {self.Y_train.shape[1]} neurons and activation = {self.last_layer_activation}')
-            self.model.add(Dense(self.Y_train.shape[1],
+            print(f'Output layer for classification: {n_outputs} neurons and activation = {self.last_layer_activation}')
+            self.model.add(Dense(n_outputs,
                                  activation = self.last_layer_activation))
 
         elif(self.LSTM_type == 'regressor'):
             # linear output: last_layer_activation is not used by regressors
-            print(f'Output layer for regression: {self.Y_train.shape[1] * self.steps_ahead} neurons and linear activation')
-            self.model.add(Dense(self.Y_train.shape[1] * self.steps_ahead, activation = 'linear'))
+            print(f'Output layer for regression: {n_outputs} neurons and linear activation')
+            self.model.add(Dense(n_outputs, activation = 'linear'))
+
+        if((self.class_weight is not None) and (n_outputs > 1)):
+            warnings.warn('With more than one output Keras applies class_weight to the argmax of each target row '
+                          '(one-hot assumption), which is not meaningful for independent binary outputs.',
+                          UserWarning,
+                          stacklevel = 2)
 
         # compile
         self.model.compile(optimizer = tensorflow.keras.optimizers.Adam(learning_rate = self.learning_rate),
@@ -980,13 +993,90 @@ class fastLSTM:
         print(self.model_summary)
 
 
+    def make_multi_step_targets(self, Y_values):
+        """
+        Stack each target row with the following ``steps_ahead - 1`` rows.
+
+        Row ``t`` of the result is ``Y[t], Y[t + 1], ..., Y[t + steps_ahead - 1]``
+        (step-major: all target columns of step 1, then all of step 2, ...).
+        The last ``steps_ahead - 1`` rows have no complete future and are
+        filled with NaN; the generators never use them.
+
+        Parameters
+        ----------
+        Y_values : array-like
+            Targets, shape ``(n_rows, n_targets)``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape ``(n_rows, n_targets * steps_ahead)``; ``Y_values`` itself
+            (as an array) when ``steps_ahead == 1``.
+
+        Examples
+        --------
+        >>> lstm.steps_ahead = 3
+        >>> lstm.make_multi_step_targets(np.array([[1.], [2.], [3.], [4.]]))
+        array([[ 1.,  2.,  3.],
+               [ 2.,  3.,  4.],
+               [ 3.,  4., nan],
+               [ 4., nan, nan]])
+        """
+        Y_values = np.asarray(Y_values, dtype = float)
+
+        if(self.steps_ahead == 1):
+            return Y_values
+
+        n_rows, n_targets = Y_values.shape
+        Y_multi = np.full((n_rows, n_targets * self.steps_ahead), np.nan)
+
+        for step in range(self.steps_ahead):
+            # block `step` holds the targets `step` rows ahead
+            Y_multi[:n_rows - step, step * n_targets:(step + 1) * n_targets] = Y_values[step:]
+
+        return Y_multi
+
+
+    def output_column_names(self):
+        """
+        Names of the network outputs, in the order of the prediction columns.
+
+        Returns
+        -------
+        list of str
+            The target column names when ``steps_ahead == 1``; otherwise
+            ``'<target>_step_<k>'`` for k = 1 ... ``steps_ahead``, step-major
+            (all targets of step 1, then all targets of step 2, ...). Step 1
+            is the target row right after the input window (see
+            :meth:`create_generators`).
+
+        Examples
+        --------
+        >>> lstm.steps_ahead = 2
+        >>> lstm.output_column_names()
+        ['up_step_1', 'up_step_2']
+        """
+        if(self.Y_data is not None):
+            target_names = list(self.Y_data.columns)
+        else:
+            target_names = list(getattr(self, 'Y_feature_names', None) or range(self.Y_train.shape[1]))
+
+        if(self.steps_ahead == 1):
+            return [str(name) for name in target_names]
+
+        return [f'{name}_step_{step + 1}' for step in range(self.steps_ahead) for name in target_names]
+
+
     def create_generators(self, batch_size = None):
         """
         Create the training and validation sample generators.
 
         ``TimeseriesGenerator`` pairs target row ``t`` with the feature rows
-        ``t - timesteps ... t - 1``; so each generator yields
-        ``len(data) - timesteps`` samples of shape ``(timesteps, n_features)``.
+        ``t - timesteps ... t - 1``; with ``steps_ahead > 1`` the target of
+        the sample is ``Y[t], ..., Y[t + steps_ahead - 1]`` (see
+        :meth:`make_multi_step_targets`). Each generator yields
+        ``len(data) - timesteps - steps_ahead + 1`` samples of shape
+        ``(timesteps, n_features)``.
 
         Parameters
         ----------
@@ -1008,8 +1098,17 @@ class fastLSTM:
         if(batch_size is not None):
             self.batch_size = batch_size
 
-        self.generator = TimeseriesGenerator(self.X_train_s, self.Y_train_s, length = self.timesteps, batch_size = self.batch_size)
-        self.validation_generator = TimeseriesGenerator(self.X_test_s, self.Y_test_s, length = self.timesteps, batch_size = self.batch_size)
+        # the last target row usable is the one that still has steps_ahead - 1 rows after it
+        self.generator = TimeseriesGenerator(self.X_train_s,
+                                             self.make_multi_step_targets(self.Y_train_s),
+                                             length = self.timesteps,
+                                             end_index = len(self.X_train_s) - self.steps_ahead,
+                                             batch_size = self.batch_size)
+        self.validation_generator = TimeseriesGenerator(self.X_test_s,
+                                                        self.make_multi_step_targets(self.Y_test_s),
+                                                        length = self.timesteps,
+                                                        end_index = len(self.X_test_s) - self.steps_ahead,
+                                                        batch_size = self.batch_size)
 
 
     def network_training(self, epochs, batch_size = None, timesteps = None):
@@ -1441,8 +1540,10 @@ class fastLSTM:
         Probabilities predicted on the validation generator are turned into
         0/1 with the threshold ``min_probability`` and compared with the
         actual targets through sklearn's ``classification_report`` (printed
-        for every target column). The first ``timesteps`` test rows have no
-        prediction and are excluded.
+        for every output, i.e. every target column and, with
+        ``steps_ahead > 1``, every step: see :meth:`output_column_names`).
+        The first ``timesteps`` test rows (and the last ``steps_ahead - 1``)
+        have no prediction and are excluded.
 
         Parameters
         ----------
@@ -1454,12 +1555,13 @@ class fastLSTM:
         Returns
         -------
         filtered_predictions_results_df : pandas.DataFrame
-            0/1 predictions, one column per target.
+            0/1 predictions, one column per output (named as
+            :meth:`output_column_names`).
         predictions_df : pandas.DataFrame
             Raw predicted probabilities (columns numbered from 0).
         report : dict
             Only when ``output_dict = True``: classification report of the
-            LAST target column.
+            LAST output (last target column, last step).
 
         Examples
         --------
@@ -1475,8 +1577,11 @@ class fastLSTM:
         predictions_df = pd.DataFrame(predictions.reshape(predictions.shape[0], -1))
         filtered_predictions_results_df = pd.DataFrame()
 
-        # the generator has no sample for the first `timesteps` test rows (see create_generators)
-        Y_test = self.Y_test.iloc[self.timesteps:]
+        # actual targets of each sample: the generator skips the first `timesteps` test rows and,
+        # with steps_ahead > 1, the last steps_ahead - 1 rows (no complete future)
+        Y_test_multi = self.make_multi_step_targets(self.Y_test.values)
+        Y_test = pd.DataFrame(Y_test_multi[self.timesteps:len(Y_test_multi) - self.steps_ahead + 1],
+                              columns = self.output_column_names())
 
         print(f'len predictions {len(predictions_df)}')
         print(f'len Y_test (without the first {self.timesteps} rows) {len(Y_test)}')
@@ -1485,8 +1590,9 @@ class fastLSTM:
         for count, col_name in enumerate(Y_test.columns):
 
             filtered_predictions_results_df[col_name] = predictions_df[count].apply(lambda x: 1 if x > min_probability else 0 ).values
-            report = classification_report(Y_test[col_name], filtered_predictions_results_df[col_name], output_dict = output_dict)
+            report = classification_report(Y_test[col_name].astype(int), filtered_predictions_results_df[col_name], output_dict = output_dict)
 
+            print(f'\n{col_name}')
             print(report)
 
         if(output_dict == False):
@@ -1814,7 +1920,8 @@ class fastLSTM:
         Returns
         -------
         numpy.ndarray
-            Predictions of shape ``(n_samples, n_outputs)``.
+            Predictions of shape ``(n_samples, n_targets * steps_ahead)``;
+            column names and order are given by :meth:`output_column_names`.
 
         Raises
         ------
@@ -1848,7 +1955,10 @@ class fastLSTM:
         predictions = self.model.predict(data)
 
         if descale_result and self.scale_targets and (self.Y_scaler is not None):
-            predictions = self.Y_scaler.inverse_transform(predictions)
+            # the scaler works on n_targets columns: with steps_ahead > 1 each step block is descaled separately
+            n_samples = predictions.shape[0]
+            n_targets = predictions.shape[1] // self.steps_ahead
+            predictions = self.Y_scaler.inverse_transform(predictions.reshape(-1, n_targets)).reshape(n_samples, -1)
 
         return predictions
 
