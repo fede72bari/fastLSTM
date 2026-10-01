@@ -1,200 +1,476 @@
-# fastLSTM: A Structured Framework for LSTM Networks
+# fastLSTM
 
-## Overview
+**A structured framework to build, train, version and reuse LSTM networks for time series, with a few lines of code.**
 
-### What is fastLSTM?
-`fastLSTM` is a structured framework designed to simplify the creation and training of Long Short-Term Memory (LSTM) models for both classification and regression tasks. Unlike manual LSTM model construction in TensorFlow/Keras, `fastLSTM` streamlines the process by automating key aspects such as:
-- **Data structuring with generators**: Automatically aligns `timesteps` to match input-output sequences.
-- **Multi-step forecasting**: `steps_ahead` predicts the next `k` values of every target at once.
-- **Optimized model architecture**: Correctly initializes the first and last layers, avoiding common issues in LSTM design.
-- **Scalability and data preprocessing**: Integrates automated scaling and dataset splitting.
+## Overview: why fastLSTM
 
-### Why Use fastLSTM?
-- **Automates LSTM structuring**: Eliminates the need for manual sequence preparation.
-- **Ensures proper layer structuring**: Avoids errors in input and output dimensions.
-- **Pre-built training mechanisms**: Includes early stopping and checkpointing of the best model.
-- **Supports multiple loss functions and scalers**: Enables flexibility in various ML tasks.
+Training a recurrent network "by hand" with Keras means writing, every time, the same fragile plumbing: splitting the data without look-ahead, fitting scalers only on the training set, reshaping tables into `(samples, timesteps, features)` sequences, aligning each window with the right target, sizing input and output layers, setting `return_sequences` correctly on stacked layers, adding early stopping and checkpoints, and then saving the model **together with** the scalers, the data and the settings that produced it. Most bugs in time-series models live in this plumbing (look-ahead leaks, misaligned targets, a model reloaded with the wrong scaler), and most of the time spent on experiments goes into rewriting it.
 
----
+`fastLSTM` turns that plumbing into a tested, reusable class, so a data scientist can focus on the questions that matter: *which features, which targets, which architecture, which horizon*.
 
-## Hyperparameters
+What it does for you:
 
-Parameter names, method names and saved files follow the sister package `fastANN`, so the same keyword-argument workflow works with both classes; only the parameters that make sense just for recurrent networks (`LSTM_type`, `timesteps`, `steps_ahead`, `class_weight`) are LSTM-specific. fastANN options not available here: pre-split `X_train_s`/`Y_train`/`X_test_s`/`Y_test` inputs, `split_type` (the split is always sequential) and `autoencoder_mode`.
+- **Correct data preparation** — sequential train/test split (no shuffling of time), scalers fitted on the training set only, sequences built by `TimeseriesGenerator` with a documented alignment between input window and target.
+- **Architecture from a short description** — `model_relative_width = [2, 1]` means "two hidden LSTM layers, twice and once the number of features"; input and output layers are sized automatically, also for multiple targets and multi-step horizons.
+- **Multi-step forecasting** — `steps_ahead = k` trains the network on the next `k` values of every target at once, for regression and classification.
+- **Training best practices built in** — early stopping, checkpoint of the best epoch (reloaded at the end), class weights, training-history plots.
+- **Reproducibility and model versioning** — every training run is saved as a self-describing, timestamped set of files (model, scalers, data, hyperparameters, history) and restored with one call (see [Model versioning](#model-versioning-runs-datasets-and-hyperparameters)).
+- **Evaluation and use** — classification reports per output, precision/recall vs probability cutoff, gradient-based feature importance, ready-to-use prediction on new data with automatic scaling/descaling.
+- **One workflow for two model families** — `fastLSTM` shares parameter names, method names and saved-file layout with its sister package [`fastANN`](https://github.com/fede72bari/fastANN) (dense networks): the same code pattern trains, saves and reloads both, so they can be compared on the same data.
 
-### Model Architecture Parameters
-| Parameter                  | Description |
-|----------------------------|-------------|
-| `model_relative_width`     | List with the width of each **hidden** LSTM layer, relative to the number of input features (e.g. `[2, 1]` = two hidden layers with `2 * n_features` and `n_features` units). Input and output layers are added automatically. |
-| `model_dropout`            | Dropout rate after each hidden layer (same length as `model_relative_width`). |
-| `LSTM_type`                | `'classificator'` (output activation `last_layer_activation`) or `'regressor'` (linear output). |
-| `activation`               | Activation function for LSTM layers (e.g. `'tanh'`, `'relu'`). |
-| `last_layer_activation`    | Activation function of the output layer of classificators (e.g. `'sigmoid'`, `'softmax'`). |
-
-### Data Parameters
-| Parameter                  | Description |
-|----------------------------|-------------|
-| `X_data`, `Y_data`         | Features and targets (DataFrames, chronological order). Optional when the model is restored with `load_all`. |
-| `scaler_type`              | `'StandardScaler'` (default) or `'MinMaxScaler'`. |
-| `scale_targets`            | If `True` targets are scaled too and `model_predict` can descale predictions. |
-| `train_size_rate`          | Fraction of rows used for training (default `0.7`); the split is always sequential. |
-| `timesteps`                | Number of past rows in each input sequence. |
-| `steps_ahead`              | Number of consecutive future steps predicted for each target (classificators and regressors). With `steps_ahead = k` each sample is trained on the next `k` target rows and the network has `n_targets * k` outputs, named by `output_column_names()` (e.g. `up_step_1`, `up_step_2`, ...). |
-| `save_X_Y_data`            | If `True` (default) `X_data` and `Y_data` are saved with the model. |
-
-### Training Parameters
-| Parameter                  | Description |
-|----------------------------|-------------|
-| `learning_rate`            | Learning rate of the Adam optimizer. Default is `0.0003`. |
-| `loss`                     | Loss function (e.g. `'binary_crossentropy'`, `'mse'`, `'CategoricalCrossentropy'`). |
-| `metrics`                  | List of evaluation metrics (e.g. `['accuracy']`). |
-| `batch_size`               | Batch size for training, default `128`. |
-| `class_weight`             | Optional class weights, e.g. `{0: 1.0, 1: 3.0}`. |
-| `history_metrics`          | Training-history columns plotted by `plot_training_history` (default depends on `LSTM_type`). |
-
-### Early Stopping and Checkpoints
-| Parameter                    | Description |
-|------------------------------|-------------|
-| `early_stop_monitor_metric`  | Metric monitored for early stopping (default `'val_accuracy'`). |
-| `early_stop_mode`            | `'max'` or `'min'` depending on `early_stop_monitor_metric`. |
-| `early_stop_patience`        | Number of epochs to wait before stopping if no improvement is detected. |
-| `checkpoint_monitor_metric`  | Metric used to save the best-performing model (default `'val_accuracy'`). |
-| `checkpoint_mode`            | `'max'` or `'min'` depending on `checkpoint_monitor_metric`. |
-| `save_best_only`             | If `True`, saves only the best model during training. |
-
-### Renamed parameters
-The old names are still accepted (with a `DeprecationWarning`), and hyperparameters files saved with them can still be loaded.
-
-| Old name                | New name |
-|-------------------------|----------|
-| `scaler`                | `scaler_type` |
-| `metric`                | `metrics` |
-| `check_point_metric`    | `checkpoint_monitor_metric` |
-| `early_stop_condittion` | `early_stop_monitor_metric` |
-| `metric_mode`           | `checkpoint_mode` and `early_stop_mode` |
-| `scale_target`          | `scale_targets` |
-| `binary_network_predictions_evaluation()` | `network_predictions_evaluation()` (returns `predictions_df` too; the old name keeps the old return values) |
-| `load_training_history(file_path_name=<csv path>)` | `load_training_history(training_history_file_name, file_path_name=<folder>)` |
+Typical uses: price/return forecasting, direction (up/down) classification, multi-horizon forecasts, any sequence-to-value problem on tabular time series.
 
 ---
 
-## Model and Data Saving Mechanisms
+## Contents
 
-fastLSTM includes built-in functionalities to save models, data, scalers, hyperparameters, and training history, ensuring full reproducibility and ease of use. Every file name starts with the training timestamp and ends with `model_name`; all files are written in `data_storage_path`.
+1. [Installation](#installation)
+2. [Quick start](#quick-start)
+3. [Key concepts](#key-concepts)
+4. [Constructor parameters](#constructor-parameters)
+5. [Methods reference](#methods-reference)
+6. [Saved files](#saved-files)
+7. [Model versioning: runs, datasets and hyperparameters](#model-versioning-runs-datasets-and-hyperparameters)
+8. [Examples](#examples)
+9. [Backward compatibility](#backward-compatibility)
+10. [Tips and caveats](#tips-and-caveats)
 
-### **Model Saving**
-- The best-performing model is automatically saved based on the checkpoint metric.
-- Stored in `.keras` format with a timestamped filename.
-- Example filename: `2025-03-07 10-00-00 - LSTM MODEL - fastLSTM.keras`
+---
 
-### **Data Saving**
-- If `save_X_Y_data=True`, the training dataset (`X_data` and `Y_data`) is saved as `.csv` files (without the index).
-- Example filenames:
-  - `2025-03-07 10-00-00 - X_data FOR LSTM MODEL - fastLSTM.csv`
-  - `2025-03-07 10-00-00 - Y_data FOR LSTM MODEL - fastLSTM.csv`
+## Installation
 
-### **Scaler Saving**
-- Input and (when `scale_targets=True`) target scalers are stored as `.pkl` files.
-- Example filenames:
-  - `2025-03-07 10-00-00 - SCALER FOR LSTM MODEL - fastLSTM.pkl`
-  - `2025-03-07 10-00-00 - Y SCALER FOR LSTM MODEL - fastLSTM.pkl`
+The package is the `fastLSTM` folder of this repository (no `pip` package yet).
 
-### **Training History Saving**
-- Training history (loss and metrics per epoch) is stored in a `.csv` file and plotted by `plot_training_history()`.
-- Example filename:
-  - `2025-03-07 10-00-00 - TRAINING HISTORY OF LSTM MODEL - fastLSTM.csv`
-
-### **Hyperparameters Saving**
-- Model hyperparameters are stored in a `.json` file.
-- Example filename:
-  - `2025-03-07 10-00-00 - HYPERPARAMETERS OF LSTM MODEL - fastLSTM.json`
-
-### **Loading Saved Models and Data**
-To reload a trained model with all its settings:
-```python
-model = fastLSTM()
-model.load_all("2025-03-07 10-00-00 - HYPERPARAMETERS OF LSTM MODEL - fastLSTM.json", file_path_name = "./models/")
+```bash
+git clone https://github.com/fede72bari/fastLSTM.git
 ```
-This restores the hyperparameters, model, scalers, training history and dataset split. Files are read from the folder of the JSON (`file_path_name`), so a model folder can be moved or copied to another machine. The single steps are also available as `load_hyperparameters`, `set_hyperparameters`, `load_model`, `load_scaler` and `load_training_history`.
+
+Then either copy the inner `fastLSTM/` folder next to your notebook/script, or add the repository folder to the Python path:
+
+```python
+import sys
+sys.path.append('/path/to/fastLSTM')   # the cloned repository folder
+from fastLSTM import fastLSTM
+```
+
+### Requirements
+
+Python 3.9+ and:
+
+| Purpose | Packages |
+|---|---|
+| Core | `tensorflow` (2.x, Keras 3 supported), `scikit-learn`, `pandas`, `numpy`, `scipy`, `joblib` |
+| Plots and notebooks | `matplotlib`, `plotly`, `ipython` |
+| Imported by the module (shared toolbox) | `xgboost`, `seaborn`, `tabulate`, `statsmodels`, `imbalanced-learn`, `deap`, `yfinance`, `pytz` |
+
+```bash
+pip install tensorflow scikit-learn pandas numpy scipy joblib matplotlib plotly ipython \
+            xgboost seaborn tabulate statsmodels imbalanced-learn deap yfinance pytz
+```
+
+Tested with TensorFlow 2.21, pandas 3.0, NumPy 2.4, scikit-learn 1.9, SciPy 1.17 and Plotly 7.
 
 ---
 
-## Example
+## Quick start
 
 ```python
+import pandas as pd
 from fastLSTM import fastLSTM
+
+# X_df: features, one row per bar, chronological order
+# Y_df: targets aligned with X_df (here a 0/1 column 'up')
 
 lstm = fastLSTM(X_data = X_df,
                 Y_data = Y_df[['up']],
-                model_relative_width = [2, 1],     # two hidden LSTM layers
+                model_relative_width = [2, 1],       # two hidden LSTM layers
                 model_dropout = [0.2, 0.1],
-                timesteps = 20,
-                class_weight = {0: 1.0, 1: 2.0},
-                data_storage_path = './models/',
+                timesteps = 20,                      # each sample sees the last 20 bars
+                data_storage_path = './models/',     # must end with a separator
                 model_name = 'direction')
 
-lstm.network_structure_set_compile()
-lstm.network_training(epochs = 200, batch_size = 64)
+lstm.network_structure_set_compile()                  # build + compile
+lstm.network_training(epochs = 200, batch_size = 64)  # train, save everything, reload best epoch
 
 results_df, probabilities_df = lstm.network_predictions_evaluation(min_probability = 0.5)
-pr_df = lstm.binary_precision_recall_vs_scoring(n_points = 30)
+```
 
-sample = lstm.prepare_input_sample(X_df, len(X_df) - 1, apply_scaler = False)
-prediction = lstm.model_predict(sample)
+Later, in another session:
+
+```python
+lstm = fastLSTM()
+lstm.load_all('2025-03-07 10-00-00 - HYPERPARAMETERS OF LSTM MODEL - direction.json',
+              file_path_name = './models/')
+
+sample = lstm.prepare_input_sample(new_X_df, len(new_X_df) - 1, apply_scaler = False)
+prediction = lstm.model_predict(sample)               # scaled inside, descaled if needed
 ```
 
 ---
 
-## Function Parameters and Inputs
+## Key concepts
 
-Every method has a complete docstring (`help(fastLSTM.network_training)`); the main ones are summarised here.
+### Network architecture
 
-### `network_structure_set_compile(timesteps=None)`
-Builds one LSTM + Dropout block per element of `model_relative_width`, adds the input and output layers and compiles the network.
-#### **Parameters:**
-- `timesteps` (int, optional): Number of timesteps for input sequences.
+`model_relative_width` lists the **hidden** LSTM layers only; the input and output layers are always added automatically:
 
-### `network_training(epochs, batch_size=None, timesteps=None)`
-Trains the model using a sequence generator and saves model, scalers, history, hyperparameters and data.
-#### **Parameters:**
-- `epochs` (int): Maximum number of epochs.
-- `batch_size` (int, optional): Training batch size.
-- `timesteps` (int, optional): Overrides default timesteps (the network must be built with the same value).
+```
+Input(timesteps, n_features)
+LSTM(n_features * model_relative_width[0])  + Dropout(model_dropout[0])
+...
+LSTM(n_features * model_relative_width[-1]) + Dropout(model_dropout[-1])
+Dense(n_targets * steps_ahead)              # output
+```
 
-### `model_predict(data, apply_scaler=True, descale_result=True)`
-Generates predictions from input sequences.
-#### **Parameters:**
-- `data` (array): Sequences of shape `(n_samples, timesteps, n_features)` or a single `(timesteps, n_features)` sequence (see `prepare_input_sample`).
-- `apply_scaler` (bool): If `True`, applies feature scaling.
-- `descale_result` (bool): If `True`, reverses output scaling (when `scale_targets=True`).
+- Widths are **relative to the number of features**: with 10 features, `[2, 1]` gives layers of 20 and 10 units.
+- `model_dropout` must have the same length as `model_relative_width`.
+- Every LSTM layer except the last returns the whole sequence; the last returns only its final state, which feeds the output layer (this also holds with a single hidden layer).
 
-### `network_predictions_evaluation(min_probability, output_dict=False)`
-Evaluates a binary classificator on the test set with a probability threshold.
-#### **Parameters:**
-- `min_probability` (float): Minimum probability threshold for classification.
-- `output_dict` (bool): If `True`, also returns the classification report as a dictionary.
-#### **Returns:**
-- `(filtered_predictions_results_df, predictions_df)` or `(filtered_predictions_results_df, predictions_df, report)`.
+### How samples are built (`timesteps`)
 
-### `binary_precision_recall_vs_scoring(n_points=15, plot=True)`
-Precision and recall of class `1` for cutoffs from `n_points / 100` to `0.99`.
+Samples are created with Keras' `TimeseriesGenerator`: target row **`t`** is paired with the feature rows **`t - timesteps … t - 1`**. Row `t` itself is *not* in the input window, so:
 
-### `gradient_feature_importance(feature_names=None)`
-Gradient-based feature importance on the test set.
+- `Y_data` row `t` is what the network learns to predict *after* seeing the window that ends at row `t - 1`;
+- the first `timesteps` rows of each set have no prediction.
 
-### `output_column_names()`
-Names of the prediction columns: the target names, or `<target>_step_<k>` when `steps_ahead > 1` (all targets of step 1, then step 2, ...).
+### Multi-step forecasting (`steps_ahead`)
 
-### `plot_training_history()`
-Plots the training history columns listed in `history_metrics`.
+With `steps_ahead = k`, every sample is trained on the next `k` target rows at once, `Y[t], Y[t+1], …, Y[t+k-1]`, and the network has `n_targets * k` outputs. Outputs are **step-major** and named by `output_column_names()`:
 
-### `load_all(hyperparameters_file_name=None, file_path_name=None)`
-Loads a trained model, hyperparameters, scalers, training history and data.
-#### **Parameters:**
-- `hyperparameters_file_name` (str): JSON file with saved hyperparameters.
-- `file_path_name` (str, optional): Folder of the saved files.
+```python
+lstm.output_column_names()
+# Y_data columns ['y', 'y2'], steps_ahead = 3:
+# ['y_step_1', 'y2_step_1', 'y_step_2', 'y2_step_2', 'y_step_3', 'y2_step_3']
+```
+
+It works for regressors (next `k` values) and classificators (e.g. "will it go up at step 1, 2, 3?"). The last `k - 1` rows of each set have no complete future and are not used as samples. With `steps_ahead = 1` (default) there is one output per target column.
+
+### Split and scaling
+
+- The split is always **sequential** (first `train_size_rate` of the rows for training, the rest for test) to avoid look-ahead.
+- Features are scaled with `StandardScaler` or `MinMaxScaler` (`scaler_type`), fitted on the training set only.
+- Targets are scaled only with `scale_targets = True` (useful for regressors); `model_predict` then returns predictions in the original scale.
+
+### Classificator vs regressor
+
+| `LSTM_type` | Output activation | Typical loss | Typical monitor |
+|---|---|---|---|
+| `'classificator'` (default) | `last_layer_activation` (`'sigmoid'`) | `'binary_crossentropy'` | `'val_accuracy'`, mode `'max'` |
+| `'regressor'` | linear | `'mse'`, `'mae'`, `'huber'` | `'val_loss'`, mode `'min'` |
 
 ---
 
-## Conclusion
-`fastLSTM` automates dataset structuring, `timesteps` alignment and correct layer initialization, making it an ideal solution for LSTM-based sequence modeling. By integrating best practices such as early stopping, checkpointing, and data scaling, `fastLSTM` provides an efficient and robust deep learning workflow. 🚀
+## Constructor parameters
 
+`fastLSTM(**parameters)` — all parameters are optional keywords.
+
+### Data
+
+| Parameter | Type / values | Default | Description |
+|---|---|---|---|
+| `X_data` | `DataFrame` | `None` | Features, one row per time step, chronological. Required to train; omit it when restoring with `load_all()`. |
+| `Y_data` | `DataFrame` | `None` | Targets aligned with `X_data` (one column per target; 0/1 for binary classification). |
+| `scaler_type` | `'StandardScaler'`, `'MinMaxScaler'` | `'StandardScaler'` | Scaler for features (and targets if scaled). |
+| `scale_targets` | `bool` | `False` | Scale the targets too; predictions are descaled by `model_predict`. |
+| `train_size_rate` | `float` 0–1 | `0.7` | Fraction of rows used for training (sequential split). |
+| `timesteps` | `int` | `1` | Length of each input sequence (past rows seen per prediction). |
+| `steps_ahead` | `int` | `1` | Number of future steps predicted for each target (see [Multi-step forecasting](#multi-step-forecasting-steps_ahead)). |
+| `save_X_Y_data` | `bool` | `True` | Save `X_data`/`Y_data` as CSV at training time, so `load_all()` can rebuild the same split. |
+
+### Architecture
+
+| Parameter | Type / values | Default | Description |
+|---|---|---|---|
+| `model_relative_width` | `list` of `float` | `[1]` | Width of each hidden LSTM layer relative to the number of features. Its length = number of hidden layers. |
+| `model_dropout` | `list` of `float` 0–1 | `[0]` | Dropout after each hidden layer (same length as `model_relative_width`). |
+| `LSTM_type` | `'classificator'`, `'regressor'` | `'classificator'` | Output layer type (see table above). |
+| `activation` | Keras activation name | `'tanh'` | Activation of the LSTM layers. `'tanh'` enables the fast cuDNN kernel on GPU. |
+| `last_layer_activation` | `'sigmoid'`, `'softmax'`, … | `'sigmoid'` | Output activation of classificators. Use `'softmax'` only for one-hot classes with `steps_ahead = 1`. |
+
+### Training
+
+| Parameter | Type / values | Default | Description |
+|---|---|---|---|
+| `learning_rate` | `float` | `0.0003` | Adam learning rate. |
+| `loss` | Keras loss name or object | `'binary_crossentropy'` | e.g. `'mse'`, `'mae'`, `'categorical_crossentropy'`; class names `'BinaryCrossentropy'`, `'CategoricalCrossentropy'`, `'SparseCategoricalCrossentropy'` are also accepted. |
+| `metrics` | `list` of `str` (or `str`) | `['accuracy']` | Metrics logged by Keras (validation ones get the `val_` prefix). |
+| `batch_size` | `int` | `128` | Batch size of the generators (can be overridden in `network_training`). |
+| `class_weight` | `dict` | `None` | e.g. `{0: 1.0, 1: 3.0}` to rebalance classes. Meaningful with a single output. |
+| `history_metrics` | `list` of `str` | `None` | Columns plotted by `plot_training_history()`. `None` → `['loss', 'val_loss']` for regressors, first metric and its `val_` version for classificators. |
+
+### Early stopping and checkpoint
+
+| Parameter | Type / values | Default | Description |
+|---|---|---|---|
+| `early_stop_monitor_metric` | `str` | `'val_accuracy'` | Quantity monitored by early stopping. |
+| `early_stop_mode` | `'max'`, `'min'`, `'auto'` | `'max'` | Whether it must increase or decrease. |
+| `early_stop_patience` | `int` | `200` | Epochs without improvement before stopping. |
+| `checkpoint_monitor_metric` | `str` | `'val_accuracy'` | Quantity used to pick the best epoch to save and reload. |
+| `checkpoint_mode` | `'max'`, `'min'`, `'auto'` | `'max'` | Whether it must increase or decrease. |
+| `save_best_only` | `bool` | `True` | Save only improving epochs (otherwise the last epoch is kept). |
+
+### Storage
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `data_storage_path` | `str` | `'\\cyPredict\\'` | Folder for every saved file; it is concatenated to file names, so it **must end with a separator** (`'./models/'`). |
+| `model_name` | `str` | `'LSTM'` | Name used in every saved file name. |
+
+---
+
+## Methods reference
+
+Every method has a complete docstring: `help(fastLSTM.network_training)`.
+
+### Build and train
+
+| Method | Description |
+|---|---|
+| `network_structure_set_compile(timesteps=None)` | Builds the network (see [architecture](#network-architecture)) and compiles it with Adam, `loss` and `metrics`. `timesteps` optionally changes the sequence length. The text summary is kept in `model_summary`. |
+| `network_training(epochs, batch_size=None, timesteps=None)` | Trains with early stopping and checkpointing, saves every artefact (see [Saved files](#saved-files)), reloads the best epoch into `model` and plots the history. `timesteps` must match the built network. |
+| `create_generators(batch_size=None)` | (Re)creates `generator` (training) and `validation_generator` (test). Called automatically when needed. |
+| `split_and_scale(scaler_fit=False)` | Sequential split of `X_data`/`Y_data` and scaling. `scaler_fit=True` fits the scalers (new data), `False` only applies them. Called by the constructor with `True`. |
+| `set_loss_function(loss)` | Changes the loss (recompile afterwards). |
+| `early_stop_patience_set(patience=None)` | Rebuilds the early stopping callback, optionally with a new patience. |
+| `checkpoint_callback(save_best_only=None)` | Creates the `ModelCheckpoint` callback (`model_checkpoint`). Called by `network_training`. |
+
+### Evaluate
+
+| Method | Returns | Description |
+|---|---|---|
+| `network_predictions_evaluation(min_probability, output_dict=False)` | `(results_df, probabilities_df)` or `(results_df, probabilities_df, report)` | Classificators: predictions on the test set thresholded at `min_probability` and compared with the actual values; a `classification_report` is printed for every output. `report` is the dict of the last output. |
+| `binary_precision_recall_vs_scoring(n_points=15, plot=True)` | `DataFrame` (`Cutoff`, `Precision`, `Recall`) | Precision and recall of class `1` for cutoffs from `n_points/100` to `0.99` (Plotly chart). Labels must be integers 0/1. |
+| `plot_training_history()` | – | Plots the `history_metrics` columns of `loss_df`. |
+| `gradient_feature_importance(feature_names=None)` | `(importances, names)` sorted increasingly | Mean absolute gradient of the loss w.r.t. each input feature on the test set (Plotly bar chart). |
+| `compute_gradients(inputs, targets)` | tensor | Gradient of the MSE w.r.t. the inputs (used by the method above). |
+
+### Predict
+
+| Method | Returns | Description |
+|---|---|---|
+| `prepare_input_sample(X, current_datetime_idx, apply_scaler=True)` | array `(1, timesteps, n_features)` | Sequence of the `timesteps` rows ending at position `current_datetime_idx` of `X`. The prediction refers to the following row(s). |
+| `model_predict(data, apply_scaler=True, descale_result=True)` | array `(n_samples, n_targets * steps_ahead)` | Predicts on 3D sequences `(n, timesteps, n_features)` or one 2D sequence. Scales the inputs and descales the outputs (if `scale_targets`). |
+| `output_column_names()` | `list` of `str` | Names of the prediction columns (`<target>_step_<k>` when `steps_ahead > 1`). |
+| `create_sequences(data, window_size)` | `list` | Utility: sliding windows of `window_size` rows. |
+| `make_multi_step_targets(Y_values)` | array | Stacks each target row with the following `steps_ahead - 1` rows (used by the generators). |
+
+### Save and load
+
+| Method | Description |
+|---|---|
+| `load_all(hyperparameters_file_name=None, file_path_name=None)` | Restores everything: hyperparameters, model, scalers, training history and (if saved) data, split and scaled with the loaded scalers. Files are read from `file_path_name` (the folder of the JSON), so model folders can be moved. |
+| `load_hyperparameters(file_name, file_path_name=None)` | Reads the JSON into `hyperparameters`. |
+| `set_hyperparameters()` | Applies `hyperparameters` to the attributes (old key names accepted). |
+| `load_model(model_file_name=None, file_path_name=None)` | Loads the `.keras` model. |
+| `load_scaler(scaler_file_name=None, Y_scaler_file_name=None, file_path_name=None)` | Loads the scalers (also the old single-file format). |
+| `load_training_history(training_history_file_name=None, file_path_name=None)` | Loads the history CSV into `loss_df`. |
+| `save_hyperparameters(file_name)` / `init_hyperparameters(...)` | Write / rebuild the hyperparameters dictionary (called by `network_training`). |
+
+### Main attributes
+
+| Attribute | Content |
+|---|---|
+| `model` | The Keras model. |
+| `scaler`, `Y_scaler` | Features and targets scalers (`Y_scaler` is `None` unless `scale_targets`). |
+| `X_train`, `Y_train`, `X_test`, `Y_test` | Unscaled split (DataFrames). |
+| `X_train_s`, `X_test_s`, `Y_train_s`, `Y_test_s` | Arrays used for training. |
+| `generator`, `validation_generator` | Sample generators. |
+| `loss_df` | Training history (one row per epoch). |
+| `hyperparameters` | Dictionary saved as JSON. |
+| `model_summary` | Text summary of the network. |
+
+---
+
+## Saved files
+
+`network_training()` writes into `data_storage_path` (`<dt>` = training timestamp, `<name>` = `model_name`):
+
+| File | Content |
+|---|---|
+| `<dt> - LSTM MODEL - <name>.keras` | Best (or last) model. |
+| `<dt> - SCALER FOR LSTM MODEL - <name>.pkl` | Features scaler. |
+| `<dt> - Y SCALER FOR LSTM MODEL - <name>.pkl` | Targets scaler (only with `scale_targets`). |
+| `<dt> - TRAINING HISTORY OF LSTM MODEL - <name>.csv` | Loss and metrics per epoch. |
+| `<dt> - HYPERPARAMETERS OF LSTM MODEL - <name>.json` | All settings and the names of the other files. |
+| `<dt> - X_data FOR LSTM MODEL - <name>.csv`, `<dt> - Y_data FOR LSTM MODEL - <name>.csv` | Data (only with `save_X_Y_data`; the index is not saved). |
+
+To restore a run you only need the JSON name and its folder: `fastLSTM().load_all(json_name, file_path_name = folder)`.
+
+---
+
+## Model versioning: runs, datasets and hyperparameters
+
+Every call to `network_training()` is a **run**, identified by its timestamp. A run writes a complete, self-describing snapshot: the JSON contains all hyperparameters *and* the names of the model, scaler, history and data files of that same run, so each model version stays linked to the exact dataset and settings that produced it.
+
+```
+models/
+├── 2025-03-07 10-00-00 - HYPERPARAMETERS OF LSTM MODEL - direction.json   ← entry point of the run
+├── 2025-03-07 10-00-00 - LSTM MODEL - direction.keras
+├── 2025-03-07 10-00-00 - SCALER FOR LSTM MODEL - direction.pkl
+├── 2025-03-07 10-00-00 - TRAINING HISTORY OF LSTM MODEL - direction.csv
+├── 2025-03-07 10-00-00 - X_data FOR LSTM MODEL - direction.csv
+├── 2025-03-07 10-00-00 - Y_data FOR LSTM MODEL - direction.csv
+├── 2025-03-08 15-30-12 - HYPERPARAMETERS OF LSTM MODEL - direction.json   ← a later run, same model name
+└── ...
+```
+
+What the JSON records: architecture (`model_relative_width`, `model_dropout`, `activation`, …), training settings (`loss`, `metrics`, `learning_rate`, `batch_size`, early stopping and checkpoint settings, `class_weight`), data settings (`timesteps`, `steps_ahead`, `train_size_rate`, `scaler_type`, `scale_targets`, feature and target column names) and the file names of the run.
+
+### Recommended practices
+
+1. **Keep `save_X_Y_data = True`** (default): the exact training data are saved with the model, so `load_all()` rebuilds the same split and you can always re-evaluate or audit a version.
+2. **Use `model_name` for the experiment, the timestamp for the version**: e.g. `model_name = 'direction_v2_20feat'`; every retraining adds a new timestamped run without overwriting the previous ones.
+3. **One folder per project** (`data_storage_path`), and move or copy whole folders freely: `load_all(json, file_path_name = new_folder)` reads every file from the folder of the JSON.
+4. **Compare versions** by reading their JSON and history files:
+
+```python
+import glob, json, os
+import pandas as pd
+
+rows = []
+for path in glob.glob('./models/* - HYPERPARAMETERS OF LSTM MODEL - direction*.json'):
+    hp = json.load(open(path))
+    history = pd.read_csv('./models/' + hp['training_history_file_name'], index_col = 0)
+    rows.append({'run': hp['model_training_datetime'],
+                 'layers': hp['model_relative_width'],
+                 'timesteps': hp['timesteps'],
+                 'steps_ahead': hp['steps_ahead'],
+                 'best_val_accuracy': history['val_accuracy'].max(),
+                 'json': os.path.basename(path)})
+runs = pd.DataFrame(rows).sort_values('best_val_accuracy', ascending = False)
+```
+
+5. **Reload any version** with its JSON name: `fastLSTM().load_all(runs.iloc[0]['json'], file_path_name = './models/')`.
+6. **Remember which file to use in production**: the JSON name is the only reference you need to store (in a config file, a database, a Git tag…).
+7. For long-term traceability you can version the folder itself (Git LFS, DVC, cloud storage); the file names already carry timestamp and experiment name.
+
+---
+
+## Examples
+
+### 1. Binary classification with class weights and cutoff analysis
+
+```python
+lstm = fastLSTM(X_data = X_df, Y_data = Y_df[['up']],
+                model_relative_width = [2, 1], model_dropout = [0.2, 0.1],
+                timesteps = 20, class_weight = {0: 1.0, 1: 2.0},
+                early_stop_patience = 30,
+                data_storage_path = './models/', model_name = 'direction')
+lstm.network_structure_set_compile()
+lstm.network_training(epochs = 300, batch_size = 64)
+
+results_df, probs_df, report = lstm.network_predictions_evaluation(0.5, output_dict = True)
+print(report['1']['precision'], report['1']['recall'])
+
+pr_df = lstm.binary_precision_recall_vs_scoring(n_points = 30)   # cutoffs 0.30 ... 0.99
+best = pr_df.loc[pr_df['Precision'].idxmax()]
+```
+
+### 2. Regression with scaled targets
+
+```python
+lstm = fastLSTM(X_data = X_df, Y_data = Y_df[['return']],
+                LSTM_type = 'regressor', loss = 'mse', metrics = ['mae'],
+                early_stop_monitor_metric = 'val_loss', early_stop_mode = 'min',
+                checkpoint_monitor_metric = 'val_loss', checkpoint_mode = 'min',
+                scale_targets = True, scaler_type = 'MinMaxScaler',
+                timesteps = 30, data_storage_path = './models/', model_name = 'returns')
+lstm.network_structure_set_compile()
+lstm.network_training(epochs = 200, batch_size = 32)
+
+sample = lstm.prepare_input_sample(X_df, len(X_df) - 1, apply_scaler = False)
+next_return = lstm.model_predict(sample)          # already in the original scale
+```
+
+### 3. Multi-step forecast: next 5 values of two series
+
+```python
+lstm = fastLSTM(X_data = X_df, Y_data = Y_df[['price', 'volume']],
+                LSTM_type = 'regressor', loss = 'mse', metrics = ['mae'],
+                early_stop_monitor_metric = 'val_loss', early_stop_mode = 'min',
+                checkpoint_monitor_metric = 'val_loss', checkpoint_mode = 'min',
+                scale_targets = True, timesteps = 40, steps_ahead = 5,
+                model_relative_width = [3, 2], model_dropout = [0.1, 0.1],
+                data_storage_path = './models/', model_name = 'forecast5')
+lstm.network_structure_set_compile()
+lstm.network_training(epochs = 300, batch_size = 64)
+
+sample = lstm.prepare_input_sample(X_df, len(X_df) - 1, apply_scaler = False)
+forecast = pd.DataFrame(lstm.model_predict(sample), columns = lstm.output_column_names())
+# columns: price_step_1, volume_step_1, price_step_2, volume_step_2, ... price_step_5, volume_step_5
+```
+
+### 4. Multi-step classification: "will it go up in each of the next 3 bars?"
+
+```python
+lstm = fastLSTM(X_data = X_df, Y_data = Y_df[['up']], steps_ahead = 3, timesteps = 20,
+                model_relative_width = [2, 1], model_dropout = [0.2, 0.1],
+                data_storage_path = './models/', model_name = 'up3')
+lstm.network_structure_set_compile()
+lstm.network_training(epochs = 200, batch_size = 64)
+results_df, probs_df = lstm.network_predictions_evaluation(0.5)   # one report per step
+```
+
+### 5. Restore a model and evaluate it on new data
+
+```python
+lstm = fastLSTM()
+lstm.load_all('2025-03-07 10-00-00 - HYPERPARAMETERS OF LSTM MODEL - direction.json',
+              file_path_name = './models/')
+
+lstm.X_data, lstm.Y_data = new_X_df, new_Y_df[['up']]
+lstm.split_and_scale(scaler_fit = False)          # keep the scaler fitted at training time
+lstm.network_predictions_evaluation(0.5)
+```
+
+### 6. Try a different architecture or sequence length
+
+```python
+lstm.model_relative_width = [3, 2, 1]
+lstm.model_dropout = [0.2, 0.2, 0.1]
+lstm.network_structure_set_compile(timesteps = 40)   # rebuild with the new length
+lstm.network_training(epochs = 200)
+```
+
+### 7. Feature importance
+
+```python
+importances, names = lstm.gradient_feature_importance()
+print(names[-5:])   # five most important features
+```
+
+---
+
+## Backward compatibility
+
+Parameter names were aligned with `fastANN`. The old names still work (with a `DeprecationWarning`), and models saved by older versions (old JSON keys, single scaler file) still load with `load_all()`.
+
+| Old name | New name |
+|---|---|
+| `scaler` | `scaler_type` |
+| `metric` | `metrics` |
+| `check_point_metric` | `checkpoint_monitor_metric` |
+| `early_stop_condittion` | `early_stop_monitor_metric` |
+| `metric_mode` | `checkpoint_mode` and `early_stop_mode` |
+| `scale_target` | `scale_targets` |
+| `binary_network_predictions_evaluation()` | `network_predictions_evaluation()` (also returns `predictions_df`; the old name keeps the old return values) |
+| `load_training_history(file_path_name=<csv path>)` | `load_training_history(training_history_file_name, file_path_name=<folder>)` |
+| attribute `X_scaler` | `scaler` |
+
+Note: models trained with old versions and `steps_ahead > 1` did not really learn future steps (every output learned the next value); retrain them.
+
+### Differences from fastANN
+
+Same names and workflow; LSTM-specific: `LSTM_type`, `timesteps`, `steps_ahead`, `class_weight`, `create_generators`, `prepare_input_sample`, `output_column_names`. fastANN-only: `split_type` (here the split is always sequential), `autoencoder_mode`, pre-split inputs and the `'PReLU'` activation.
+
+---
+
+## Tips and caveats
+
+- `data_storage_path` must end with `/` (or `\\` on Windows) and the folder must exist.
+- Monitor validation metrics (`val_…`) for both early stopping and checkpoint, and set the modes coherently (`'max'` for accuracy, `'min'` for losses).
+- `timesteps` passed to `network_training` must equal the one used to build the network; to change it call `network_structure_set_compile(timesteps)` first.
+- Each set must contain more than `timesteps + steps_ahead - 1` rows.
+- `binary_precision_recall_vs_scoring` and the `report` returned by `network_predictions_evaluation` refer to the **last** output (last target column, last step).
+- `class_weight` with more than one output is applied by Keras to the argmax of each target row: a warning is shown.
+- Inside Jupyter the plots appear inline; in scripts call `matplotlib.pyplot.show()` after `plot_training_history()`.
