@@ -7,11 +7,13 @@ time-series classification and regression.
 
 The package exposes a single class, :class:`fastLSTM`, whose public API
 (hyperparameter names, method names and saved-file layout) mirrors the sister
-package ``fastANN`` so that the two can be used interchangeably. Only the
-parameters and methods that only make sense for recurrent networks
-(``LSTM_type``, ``timesteps``, ``steps_ahead``, ``class_weight``,
+package ``fastANN`` so that the same keyword-argument workflow works with
+both. Only the parameters and methods that make sense just for recurrent
+networks (``LSTM_type``, ``timesteps``, ``steps_ahead``, ``class_weight``,
 ``create_generators``, ``create_sequences``, ``prepare_input_sample``) are
-LSTM-specific.
+LSTM-specific. fastANN options not available here: the pre-split
+``X_train_s`` / ``Y_train`` / ``X_test_s`` / ``Y_test`` inputs, ``split_type``
+(the split is always sequential) and ``autoencoder_mode``.
 
 Typical workflow
 ----------------
@@ -251,7 +253,8 @@ class fastLSTM:
         Quantity monitored by early stopping (e.g. ``'val_loss'``).
     checkpoint_monitor_metric : str, default 'val_accuracy'
         Quantity monitored to decide which epoch is the best one and must be
-        saved (and reloaded at the end of the training).
+        saved (and reloaded at the end of the training). Used only when
+        ``save_best_only = True``.
     checkpoint_mode : {'max', 'min', 'auto'}, default 'max'
         Whether ``checkpoint_monitor_metric`` has to be maximised or minimised.
     early_stop_mode : {'max', 'min', 'auto'}, default 'max'
@@ -259,9 +262,9 @@ class fastLSTM:
         minimised.
     history_metrics : list of str, optional
         Columns of the training history plotted by
-        :meth:`plot_training_history`. When ``None``:
-        ``['accuracy', 'val_accuracy']`` for classificators and
-        ``['loss', 'val_loss']`` for regressors.
+        :meth:`plot_training_history`. When ``None``: ``['loss', 'val_loss']``
+        for regressors, the first of ``metrics`` and its ``val_`` counterpart
+        (e.g. ``['accuracy', 'val_accuracy']``) for classificators.
     save_best_only : bool, default True
         If ``True`` the checkpoint overwrites the model file only when the
         monitored quantity improves; otherwise the model is saved at every
@@ -289,10 +292,13 @@ class fastLSTM:
         Length of the input sequences (number of past rows seen by the
         network for each prediction).
     steps_ahead : int, default 1
-        Multiplier of the output units of ``'regressor'`` networks. The
-        targets are taken from ``Y_data`` as they are (no automatic
-        shifting), so a value greater than 1 is consistent only if the loss
-        and ``Y_data`` are built accordingly; keep 1 otherwise.
+        Multiplier of the output units of ``'regressor'`` networks (units =
+        n_target_columns * steps_ahead). Targets are NOT shifted
+        automatically: each sample still has n_target_columns values, so
+        with the built-in Keras losses keep 1 (with several target columns a
+        larger value raises a shape error, with a single column the target is
+        silently broadcast to every output unit). To forecast several steps,
+        put the future values as separate ``Y_data`` columns.
     class_weight : dict, optional
         Keras class weights, e.g. ``{0: 1.0, 1: 3.0}``, to rebalance
         unbalanced classes during training.
@@ -309,7 +315,7 @@ class fastLSTM:
     ----------
     model : keras.Sequential
         The network (rebuilt by :meth:`network_structure_set_compile`,
-        replaced by the best checkpoint after :meth:`network_training`).
+        replaced by the saved checkpoint after :meth:`network_training`).
     scaler : sklearn scaler
         Features scaler.
     Y_scaler : sklearn scaler or None
@@ -412,7 +418,7 @@ class fastLSTM:
         self.learning_rate = learning_rate
         self.activation = activation
         self.last_layer_activation = last_layer_activation
-        self.metrics = [metrics] if isinstance(metrics, str) else list(metrics)
+        self.metrics = [] if metrics is None else ([metrics] if isinstance(metrics, str) else list(metrics))
         self.early_stop_monitor_metric = early_stop_monitor_metric
         self.checkpoint_monitor_metric = checkpoint_monitor_metric
         self.checkpoint_mode = checkpoint_mode
@@ -550,9 +556,10 @@ class fastLSTM:
         The dictionary is what :meth:`save_hyperparameters` writes to JSON and
         what :meth:`set_hyperparameters` reads back, so it contains both the
         network/training settings and the names of the files produced by the
-        training. Keys are the same as in fastANN, plus the LSTM-specific
-        ones (``LSTM_type``, ``timesteps``, ``steps_ahead``, ``class_weight``)
-        and ``Y_scaler_file_name``.
+        training. Keys follow fastANN (without ``split_type`` and
+        ``autoencoder_mode``), plus ``Y_scaler_file_name`` and the
+        LSTM-specific ones (``LSTM_type``, ``timesteps``, ``steps_ahead``,
+        ``class_weight``).
 
         Parameters
         ----------
@@ -672,7 +679,14 @@ class fastLSTM:
         Called by :meth:`load_all` after :meth:`load_hyperparameters`. Keys
         missing from the file (older versions) leave the current attribute
         unchanged. The early stopping callback and the loss function are
-        rebuilt so that they reflect the loaded settings.
+        rebuilt so that they reflect the loaded settings, and new unfitted
+        scalers are created if the saved ``scaler_type`` differs from the
+        current one (the fitted ones are then loaded by :meth:`load_scaler`).
+
+        ``data_storage_path`` is NOT taken from the file: the folder the
+        hyperparameters were loaded from is kept, so a model folder can be
+        moved or copied to another machine (the saved value stays in
+        ``self.hyperparameters`` for reference).
 
         Returns
         -------
@@ -703,8 +717,7 @@ class fastLSTM:
         self.Y_feature_names = self.get_hyperparameter('Y_feature_names')
 
         self.scaler_type = self.get_hyperparameter('scaler_type', self.scaler_type)
-        if(self.get_hyperparameter('data_storage_path') is not None):
-            self.data_storage_path = self.hyperparameters['data_storage_path']
+        # data_storage_path is deliberately not restored (see docstring): the saved one may not exist any more
         self.model_file_name = self.get_hyperparameter('model_file_name')
         self.scaler_file_name = self.get_hyperparameter('scaler_file_name')
         self.Y_scaler_file_name = self.get_hyperparameter('Y_scaler_file_name')
@@ -714,11 +727,22 @@ class fastLSTM:
         self.Y_data_df_file_name = self.get_hyperparameter('Y_data_df_file_name')
 
         self.scale_targets = self.get_hyperparameter('scale_targets', False)
-        if(self.scale_targets and (self.Y_scaler is None)):
+
+        # scaler objects must match the loaded scaler_type
+        if(type(self.scaler) is not type(self.new_scaler())):
+            self.scaler = self.new_scaler()
+
+        if(self.scale_targets and ((self.Y_scaler is None) or (type(self.Y_scaler) is not type(self.new_scaler())))):
             self.Y_scaler = self.new_scaler()
 
         # LSTM specific
-        self.LSTM_type = self.get_hyperparameter('LSTM_type', self.LSTM_type)
+        if('LSTM_type' in self.hyperparameters):
+            self.LSTM_type = self.hyperparameters['LSTM_type']
+        elif(self.hyperparameters.get('loss') == 'mse'):
+            # files of older versions do not store LSTM_type: 'mse' was the only regression loss they supported
+            self.LSTM_type = 'regressor'
+        else:
+            self.LSTM_type = 'classificator'
         self.timesteps = self.get_hyperparameter('timesteps', self.timesteps)
         self.steps_ahead = self.get_hyperparameter('steps_ahead', self.steps_ahead)
 
@@ -763,13 +787,24 @@ class fastLSTM:
         """
         self.loss = loss
 
-        # the check is a substring search so that also the "<...BinaryCrossentropy object at ...>"
-        # strings saved by older versions are recognised; Sparse... must be tested before Categorical...
-        if(isinstance(loss, str) and ('SparseCategoricalCrossentropy' in loss)):
+        # older versions saved str(loss object), e.g. "<...BinaryCrossentropy object at ...>" (Keras 2) or
+        # "<LossFunctionWrapper(<function binary_crossentropy ...>" (Keras 3): such reprs are matched case and
+        # underscore insensitively, plain names only by their exact class name, so that 'binary_crossentropy'
+        # and the other Keras names pass through unchanged. Sparse... must be tested before Categorical...
+        if(isinstance(loss, str) and loss.startswith('<')):
+            loss_key = loss.lower().replace('_', '')
+        elif(isinstance(loss, str)):
+            loss_key = loss.lower()
+        else:
+            loss_key = None
+
+        if(loss_key is None):
+            self.loss_function = loss
+        elif('sparsecategoricalcrossentropy' in loss_key):
             self.loss_function = SparseCategoricalCrossentropy()
-        elif(isinstance(loss, str) and ('CategoricalCrossentropy' in loss)):
+        elif('categoricalcrossentropy' in loss_key):
             self.loss_function = CategoricalCrossentropy()
-        elif(isinstance(loss, str) and ('BinaryCrossentropy' in loss)):
+        elif('binarycrossentropy' in loss_key):
             self.loss_function = BinaryCrossentropy()
         else:
             self.loss_function = loss
@@ -988,8 +1023,10 @@ class fastLSTM:
         3. hyperparameters (JSON) and scalers (``.pkl``) are saved;
         4. the network is trained on the generators with early stopping and
            checkpointing (``class_weight`` is applied if set);
-        5. the training history is saved (CSV), the best checkpoint is
-           reloaded into ``self.model`` and the history is plotted.
+        5. the training history is saved (CSV), the saved checkpoint is
+           reloaded into ``self.model`` (the best epoch when
+           ``save_best_only = True``, the last one otherwise) and the history
+           is plotted.
 
         Files written in ``data_storage_path`` (``<dt>`` = timestamp,
         ``<name>`` = ``model_name``)::
@@ -1010,29 +1047,41 @@ class fastLSTM:
         batch_size : int, optional
             When given it replaces ``self.batch_size``.
         timesteps : int, optional
-            When given it replaces ``self.timesteps``. The network must have
-            been built with the same value: call
-            ``network_structure_set_compile(timesteps)`` before changing it.
+            Must equal the input length of the built network; to use a
+            different value rebuild it first with
+            ``network_structure_set_compile(timesteps)``.
 
         Returns
         -------
         None
-            The trained (best) model is in ``self.model``, the history in
+            The trained model (best epoch if ``save_best_only = True``, last
+            epoch otherwise) is in ``self.model``, the history in
             ``self.loss_df``.
 
         Raises
         ------
         ValueError
-            If ``timesteps`` differs from the input length of the compiled
-            network.
+            If the network has not been built, if ``timesteps`` differs from
+            its input length, or if the training or test set has no more than
+            ``timesteps`` rows. Checks are done before any file is written.
 
         Examples
         --------
         >>> lstm.network_structure_set_compile()
         >>> lstm.network_training(epochs = 300, batch_size = 64)
         """
-        if(timesteps is not None):
-            self.timesteps = timesteps
+        new_timesteps = self.timesteps if timesteps is None else timesteps
+
+        # checks are done before changing anything, so that a rejected call leaves the object as it was
+        if(len(self.model.layers) == 0):
+            raise ValueError('The network is not built: call network_structure_set_compile() before training.')
+
+        # the generators produce sequences of `timesteps` rows: they must match the network input
+        if(self.model.input_shape[1] != new_timesteps):
+            raise ValueError(f'The network expects sequences of {self.model.input_shape[1]} timesteps but timesteps = {new_timesteps}: '
+                             f'call network_structure_set_compile({new_timesteps}) before training.')
+
+        self.timesteps = new_timesteps
 
         if(batch_size is not None):
             print(f'Batch size is not none, equal to {batch_size}')
@@ -1040,10 +1089,9 @@ class fastLSTM:
         else:
             print(f'Batch size is none, keep default or previous value {self.batch_size}')
 
-        # the generators produce sequences of self.timesteps rows: they must match the network input
-        if(self.model.inputs and (self.model.input_shape[1] != self.timesteps)):
-            raise ValueError(f'The network expects sequences of {self.model.input_shape[1]} timesteps but timesteps = {self.timesteps}: '
-                             f'call network_structure_set_compile({self.timesteps}) before training.')
+        # training and validation samples, built before writing any file: TimeseriesGenerator raises here
+        # if a set has no more than `timesteps` rows
+        self.create_generators()
 
         # timestamp identifying the training run
         self.model_training_datetime = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
@@ -1103,9 +1151,6 @@ class fastLSTM:
 
         self.checkpoint_callback(self.save_best_only)
 
-        # training and validation samples
-        self.create_generators()
-
         # model training (class_weight = None means no reweighting)
         if(self.class_weight is not None):
             print(f'Used class_weight: {self.class_weight}')
@@ -1120,7 +1165,7 @@ class fastLSTM:
         self.loss_df = pd.DataFrame(history.history)
         self.loss_df.to_csv(self.data_storage_path + training_history_file_name)
 
-        # keep the best model saved by the checkpoint
+        # keep the model saved by the checkpoint (best epoch when save_best_only)
         self.load_model(model_file_name)
 
         # plot history
@@ -1131,6 +1176,9 @@ class fastLSTM:
         """
         Save ``self.hyperparameters`` as JSON in ``data_storage_path``.
 
+        NumPy values are converted to plain Python values; anything else that
+        JSON cannot represent is saved as its string.
+
         Parameters
         ----------
         file_name : str
@@ -1140,8 +1188,12 @@ class fastLSTM:
         -------
         None
         """
+        # serialised before opening the file, so that an error cannot leave a truncated JSON;
+        # numpy values (e.g. widths computed with numpy) are converted to plain Python values
+        text = json.dumps(self.hyperparameters, default = lambda value: value.tolist() if hasattr(value, 'tolist') else str(value))
+
         with open(self.data_storage_path + file_name, "w") as file:
-            json.dump(self.hyperparameters, file)
+            file.write(text)
 
         print("Hyperparameters saved in " + self.data_storage_path + file_name)
 
@@ -1286,11 +1338,26 @@ class fastLSTM:
             hyperparameters.
         file_path_name : str, optional
             Folder of the file; when given it replaces ``data_storage_path``.
+            For backward compatibility, the full path of an existing CSV
+            (old signature ``load_training_history(file_path_name)``) is
+            still accepted, with a ``DeprecationWarning``.
 
         Returns
         -------
         None
         """
+        # older versions took the full path of the CSV as their only argument (file_path_name)
+        # (only one argument given, pointing to an existing file that is not inside data_storage_path)
+        legacy_path = file_path_name if training_history_file_name is None else training_history_file_name
+        if(((training_history_file_name is None) != (file_path_name is None)) and os.path.isfile(legacy_path)
+           and not os.path.isfile(self.data_storage_path + legacy_path)):
+            warnings.warn("load_training_history(<full path>) is deprecated, use "
+                          "load_training_history(training_history_file_name, file_path_name = <folder>) instead.",
+                          DeprecationWarning,
+                          stacklevel = 2)
+            self.loss_df = pd.read_csv(legacy_path, index_col = 0)
+            return
+
         if(file_path_name is not None):
             self.data_storage_path = file_path_name
 
@@ -1400,8 +1467,8 @@ class fastLSTM:
         >>> results_df, probabilities_df, report = lstm.network_predictions_evaluation(0.6, output_dict = True)
         >>> report['1']['precision']
         """
-        if(self.validation_generator is None):
-            self.create_generators()
+        # rebuilt every time (it is cheap) so that it always reflects the current split, timesteps and batch_size
+        self.create_generators()
 
         # Cut off predictions with low probability
         predictions = self.model.predict(self.validation_generator)
@@ -1433,14 +1500,25 @@ class fastLSTM:
         """
         Deprecated alias of :meth:`network_predictions_evaluation`.
 
-        Kept for backward compatibility; it returns what
-        :meth:`network_predictions_evaluation` returns.
+        Kept for backward compatibility with the return values of the old
+        method: ``(filtered_predictions_results_df, report)`` when
+        ``output_dict = True``. With ``output_dict = False`` it returns
+        ``(filtered_predictions_results_df, predictions_df)`` (the old method
+        returned the ``classification_report`` function by mistake). New code
+        should use :meth:`network_predictions_evaluation`, which returns
+        ``predictions_df`` too.
         """
         warnings.warn("binary_network_predictions_evaluation is deprecated, use network_predictions_evaluation instead.",
                       DeprecationWarning,
                       stacklevel = 2)
 
-        return self.network_predictions_evaluation(min_probability, output_dict = output_dict)
+        results = self.network_predictions_evaluation(min_probability, output_dict = output_dict)
+
+        if(output_dict == True):
+            # old contract: (filtered_predictions_results_df, report)
+            return results[0], results[2]
+
+        return results
 
 
     def plot_training_history(self):
@@ -1448,8 +1526,10 @@ class fastLSTM:
         Plot the training history (``self.loss_df``) with pandas/matplotlib.
 
         The plotted columns are ``history_metrics``; when it is ``None``,
-        ``['accuracy', 'val_accuracy']`` for classificators and
-        ``['loss', 'val_loss']`` for regressors.
+        ``['loss', 'val_loss']`` for regressors and the first of ``metrics``
+        with its validation counterpart (e.g. ``['accuracy',
+        'val_accuracy']``) for classificators. Default columns missing from
+        the history are skipped.
 
         Returns
         -------
@@ -1458,10 +1538,13 @@ class fastLSTM:
         history_metrics = self.history_metrics
 
         if(history_metrics is None):
-            if(self.LSTM_type == 'regressor'):
+            if((self.LSTM_type == 'regressor') or (len(self.metrics) == 0) or not isinstance(self.metrics[0], str)):
                 history_metrics = ['loss', 'val_loss']
             else:
-                history_metrics = ['accuracy', 'val_accuracy']
+                history_metrics = [self.metrics[0], 'val_' + self.metrics[0]]
+
+            # Keras may log a metric under a different name: keep only the columns that exist
+            history_metrics = [column for column in history_metrics if column in self.loss_df.columns] or ['loss', 'val_loss']
 
         self.loss_df[history_metrics].plot()
 
@@ -1526,7 +1609,8 @@ class fastLSTM:
         None
             Results are stored in ``X_train``, ``Y_train``, ``X_test``,
             ``Y_test`` (DataFrames) and ``X_train_s``, ``X_test_s``,
-            ``Y_train_s``, ``Y_test_s`` (numpy arrays).
+            ``Y_train_s``, ``Y_test_s`` (numpy arrays). The generators are
+            reset (rebuilt by the methods that need them).
 
         Examples
         --------
@@ -1555,10 +1639,13 @@ class fastLSTM:
         if(self.scale_targets == True):
             print('Target scaled too')
 
+            # a targets scaler created here (scale_targets switched on later) has never been fitted
+            fit_Y_scaler = scaler_fit
             if(self.Y_scaler is None):
                 self.Y_scaler = self.new_scaler()
+                fit_Y_scaler = True
 
-            if(scaler_fit == True):
+            if(fit_Y_scaler == True):
                 self.Y_train_s = self.Y_scaler.fit_transform(self.Y_train)
             else:
                 self.Y_train_s = self.Y_scaler.transform(self.Y_train)
@@ -1570,6 +1657,10 @@ class fastLSTM:
             # numpy arrays (not DataFrames): TimeseriesGenerator indexes the targets by row position
             self.Y_train_s = self.Y_train.values
             self.Y_test_s = self.Y_test.values
+
+        # generators built on the previous split are no longer valid
+        self.generator = None
+        self.validation_generator = None
 
         print('split_and_scale, end data length')
         print(f"\tShape of X_train: {self.X_train.shape}")
@@ -1820,8 +1911,8 @@ class fastLSTM:
         if(feature_names is None):
             feature_names = self.X_data.columns.tolist() if self.X_data is not None else self.X_feature_names
 
-        if(self.validation_generator is None):
-            self.create_generators()
+        # rebuilt every time (it is cheap) so that it always reflects the current split, timesteps and batch_size
+        self.create_generators()
 
         # all the test sequences and their targets, exactly as seen during validation
         batches = [self.validation_generator[i] for i in range(len(self.validation_generator))]

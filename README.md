@@ -18,7 +18,7 @@
 
 ## Hyperparameters
 
-Parameter names, method names and saved files follow the sister package `fastANN`, so the two classes can be used in the same way; only the parameters that make sense just for recurrent networks (`LSTM_type`, `timesteps`, `steps_ahead`, `class_weight`) are LSTM-specific.
+Parameter names, method names and saved files follow the sister package `fastANN`, so the same keyword-argument workflow works with both classes; only the parameters that make sense just for recurrent networks (`LSTM_type`, `timesteps`, `steps_ahead`, `class_weight`) are LSTM-specific. fastANN options not available here: pre-split `X_train_s`/`Y_train`/`X_test_s`/`Y_test` inputs, `split_type` (the split is always sequential) and `autoencoder_mode`.
 
 ### Model Architecture Parameters
 | Parameter                  | Description |
@@ -37,7 +37,7 @@ Parameter names, method names and saved files follow the sister package `fastANN
 | `scale_targets`            | If `True` targets are scaled too and `model_predict` can descale predictions. |
 | `train_size_rate`          | Fraction of rows used for training (default `0.7`); the split is always sequential. |
 | `timesteps`                | Number of past rows in each input sequence. |
-| `steps_ahead`              | Output-units multiplier for regressors (keep `1` unless `Y_data` and loss are built for it). |
+| `steps_ahead`              | Output-units multiplier for regressors. Targets are not shifted automatically: keep `1` and, to forecast several steps, put the future values as separate `Y_data` columns. |
 | `save_X_Y_data`            | If `True` (default) `X_data` and `Y_data` are saved with the model. |
 
 ### Training Parameters
@@ -71,7 +71,8 @@ The old names are still accepted (with a `DeprecationWarning`), and hyperparamet
 | `early_stop_condittion` | `early_stop_monitor_metric` |
 | `metric_mode`           | `checkpoint_mode` and `early_stop_mode` |
 | `scale_target`          | `scale_targets` |
-| `binary_network_predictions_evaluation()` | `network_predictions_evaluation()` |
+| `binary_network_predictions_evaluation()` | `network_predictions_evaluation()` (returns `predictions_df` too; the old name keeps the old return values) |
+| `load_training_history(file_path_name=<csv path>)` | `load_training_history(training_history_file_name, file_path_name=<folder>)` |
 
 ---
 
@@ -112,7 +113,7 @@ To reload a trained model with all its settings:
 model = fastLSTM()
 model.load_all("2025-03-07 10-00-00 - HYPERPARAMETERS OF LSTM MODEL - fastLSTM.json", file_path_name = "./models/")
 ```
-This restores the hyperparameters, model, scalers, training history and dataset split. The single steps are also available as `load_hyperparameters`, `set_hyperparameters`, `load_model`, `load_scaler` and `load_training_history`.
+This restores the hyperparameters, model, scalers, training history and dataset split. Files are read from the folder of the JSON (`file_path_name`), so a model folder can be moved or copied to another machine. The single steps are also available as `load_hyperparameters`, `set_hyperparameters`, `load_model`, `load_scaler` and `load_training_history`.
 
 ---
 
