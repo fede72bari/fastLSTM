@@ -4,6 +4,13 @@ All notable changes to `fastLSTM` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] - 2026-10-02
+
+### Added
+- `network_training(..., callbacks=None)`: extra Keras callbacks (e.g. a time
+  limit or a learning-rate schedule) run together with early stopping and the
+  best-epoch checkpoint.
+
 ## [2.2.0] - 2026-10-02
 
 ### Added

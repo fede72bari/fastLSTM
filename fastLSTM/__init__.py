@@ -29,7 +29,7 @@ Typical workflow
 >>> lstm.network_predictions_evaluation(min_probability = 0.5)
 """
 
-__version__ = '2.2.0'
+__version__ = '2.3.0'
 
 # ---------------------------------------------------------------------------
 #                              Libraries Import
@@ -1476,7 +1476,7 @@ class fastLSTM:
                                                             batch_size = self.batch_size)
 
 
-    def network_training(self, epochs, batch_size = None, timesteps = None):
+    def network_training(self, epochs, batch_size = None, timesteps = None, callbacks = None):
         """
         Train the network and save every artefact of the run.
 
@@ -1514,6 +1514,10 @@ class fastLSTM:
             Must equal the input length of the built network; to use a
             different value rebuild it first with
             ``network_structure_set_compile(timesteps)``.
+        callbacks : list of keras.callbacks.Callback, optional
+            Extra callbacks run together with the early stopping and the
+            best-epoch checkpoint (e.g. a time limit or a learning-rate
+            schedule).
 
         Returns
         -------
@@ -1623,7 +1627,7 @@ class fastLSTM:
                                  epochs = epochs,
                                  validation_data = self.validation_generator,
                                  class_weight = self.class_weight,
-                                 callbacks = [self.early_stop, self.model_checkpoint])
+                                 callbacks = [self.early_stop, self.model_checkpoint] + list(callbacks or []))
 
         # save history
         self.loss_df = pd.DataFrame(history.history)

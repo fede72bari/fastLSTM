@@ -23,7 +23,7 @@ Typical uses: price/return forecasting, direction (up/down) classification, mult
 
 ---
 
-**Current version: 2.2.0** (`fastLSTM.__version__`) — see the [CHANGELOG](CHANGELOG.md).
+**Current version: 2.3.0** (`fastLSTM.__version__`) — see the [CHANGELOG](CHANGELOG.md).
 
 ## Contents
 
@@ -250,7 +250,7 @@ Every method has a complete docstring: `help(fastLSTM.network_training)`.
 | Method | Description |
 |---|---|
 | `network_structure_set_compile(timesteps=None)` | Builds the network (see [architecture](#network-architecture)) and compiles it with Adam, `loss` and `metrics`. `timesteps` optionally changes the sequence length. The text summary is kept in `model_summary`. |
-| `network_training(epochs, batch_size=None, timesteps=None)` | Trains with early stopping and checkpointing, saves every artefact (see [Saved files](#saved-files)), reloads the best epoch into `model` and plots the history. `timesteps` must match the built network. |
+| `network_training(epochs, batch_size=None, timesteps=None, callbacks=None)` | Trains with early stopping and checkpointing (plus any extra Keras `callbacks`), saves every artefact (see [Saved files](#saved-files)), reloads the best epoch into `model` and plots the history. `timesteps` must match the built network. |
 | `create_generators(batch_size=None)` | (Re)creates `generator` (training) and `validation_generator` (test). Called automatically when needed. |
 | `split_and_scale(scaler_fit=False)` | Sequential split of `X_data`/`Y_data` and scaling. `scaler_fit=True` fits the scalers (new data), `False` only applies them. Called by the constructor with `True`. |
 | `set_loss_function(loss)` | Changes the loss (recompile afterwards). |
