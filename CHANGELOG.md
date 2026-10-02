@@ -4,6 +4,19 @@ All notable changes to `fastLSTM` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-10-02
+
+### Added
+- `shuffle` parameter (default `False`, the previous behaviour): permutes the
+  training windows among the batches at every epoch. Each window keeps its
+  `timesteps` rows in chronological order and its targets, the train/test
+  split stays chronological and the test generator is never shuffled. With
+  autocorrelated targets (e.g. ZigZag trend labels) chronological batches hold
+  consecutive days, often of a single class, and every epoch ends on the last
+  months of the training set: the learning curves jump from epoch to epoch.
+  Saved in the hyperparameters file (older files load as `False`).
+- `make_sequence_generator(..., shuffle=False, seed=42)`.
+
 ## [2.0.1] - 2026-10-02
 
 ### Fixed

@@ -29,7 +29,7 @@ Typical workflow
 >>> lstm.network_predictions_evaluation(min_probability = 0.5)
 """
 
-__version__ = '2.0.1'
+__version__ = '2.1.0'
 
 # ---------------------------------------------------------------------------
 #                              Libraries Import
@@ -217,13 +217,17 @@ def load_keras(backend = None):
     return keras
 
 
-def make_sequence_generator(keras, data, targets, length, batch_size, end_index = None):
+def make_sequence_generator(keras, data, targets, length, batch_size, end_index = None, shuffle = False, seed = 42):
     """
     Batches of (sequence, target) samples for Keras, on any backend.
 
     Same pairing as Keras' former ``TimeseriesGenerator``: target row ``t`` is
     paired with the data rows ``t - length ... t - 1``, for
-    ``t = length ... end_index``, in chronological order (no shuffling).
+    ``t = length ... end_index``. With ``shuffle = False`` the samples are
+    served in chronological order; with ``shuffle = True`` the ORDER OF THE
+    SAMPLES is permuted at every epoch, so each batch mixes windows from the
+    whole period. The rows inside each window always stay in chronological
+    order (only the sample axis is permuted, never the time axis).
 
     Parameters
     ----------
@@ -239,6 +243,12 @@ def make_sequence_generator(keras, data, targets, length, batch_size, end_index 
         Number of samples per batch.
     end_index : int, optional
         Last target row used (inclusive); defaults to the last row.
+    shuffle : bool, default False
+        Permute the samples among the batches at every epoch (training set).
+        Never use it for a validation/test generator whose predictions must
+        be aligned with the dates.
+    seed : int, default 42
+        Seed of the permutations (reproducible runs).
 
     Returns
     -------
@@ -263,16 +273,29 @@ def make_sequence_generator(keras, data, targets, length, batch_size, end_index 
     # the class is defined here, on the Keras module currently loaded, so that Keras recognises it
     class SequenceGenerator(keras.utils.PyDataset):
 
+        def __init__(self):
+            super().__init__()
+            # target rows of all the samples; with shuffle their order is permuted at every epoch
+            self.target_rows = np.arange(length, last_index + 1)
+            self.rng = np.random.default_rng(seed)
+            if(shuffle):
+                self.rng.shuffle(self.target_rows)
+
         def __len__(self):
             return (last_index - length + batch_size) // batch_size
 
         def __getitem__(self, index):
             if(index < 0):
                 index += len(self)
-            rows = np.arange(length + index * batch_size, min(length + (index + 1) * batch_size, last_index + 1))
-            # sample for target row r: the `length` rows before r
+            rows = self.target_rows[index * batch_size:(index + 1) * batch_size]
+            # sample for target row r: the `length` rows before r, in chronological order
             X_batch = np.stack([data[row - length:row] for row in rows])
             return X_batch, targets[rows]
+
+        def on_epoch_end(self):
+            # new order of the samples for the next epoch (the windows themselves are unchanged)
+            if(shuffle):
+                self.rng.shuffle(self.target_rows)
 
     return SequenceGenerator()
 
@@ -436,6 +459,17 @@ class fastLSTM:
         unbalanced classes during training. Meaningful with a single output
         (one binary target, ``steps_ahead = 1``): with more outputs Keras
         applies it to the argmax of each target row.
+    shuffle : bool, default False
+        Permute the training samples among the batches at every epoch. Each
+        sample (a window of ``timesteps`` consecutive rows and its targets)
+        is left intact and the train/test split stays chronological: only the
+        order in which the windows are presented to the network changes.
+        Recommended for strongly autocorrelated targets (e.g. trend/ZigZag
+        labels): in chronological order each batch holds consecutive days,
+        often of one class only, and every epoch ends on the last months of
+        the training set, which makes the learning curves jump. The test
+        generator is never shuffled. ``False`` keeps the behaviour of the
+        previous versions.
     backend : {'tensorflow', 'torch'}, optional
         Deep learning framework that runs the network (through Keras 3).
         ``None`` (default) keeps the backend already active in the Python
@@ -539,6 +573,7 @@ class fastLSTM:
                  timesteps = 1,
                  steps_ahead = 1,
                  class_weight = None,
+                 shuffle = False,
                  backend = None,
                  **legacy_kwargs):
 
@@ -581,6 +616,7 @@ class fastLSTM:
         self.steps_ahead = steps_ahead
         self.batch_size = batch_size
         self.class_weight = class_weight
+        self.shuffle = shuffle
 
         self.hyperparameters_file_name = None
 
@@ -785,6 +821,7 @@ class fastLSTM:
                                'timesteps': self.timesteps,
                                'steps_ahead': self.steps_ahead,
                                'class_weight': class_weight,
+                               'shuffle': self.shuffle,
                                # informative: saved models can be reloaded with either backend
                                'backend': self.backend
                               }
@@ -905,6 +942,8 @@ class fastLSTM:
             class_weight = {int(label) if str(label).lstrip('-').isdigit() else label: weight
                             for label, weight in class_weight.items()}
         self.class_weight = class_weight
+        # files of versions < 2.1 do not store shuffle: they always trained in chronological order
+        self.shuffle = self.get_hyperparameter('shuffle', False)
 
         # callbacks depend on the loaded settings
         self.early_stop_patience_set(self.early_stop_patience)
@@ -1286,7 +1325,8 @@ class fastLSTM:
                                                  self.make_multi_step_targets(self.Y_train_s),
                                                  length = self.timesteps,
                                                  end_index = len(self.X_train_s) - self.steps_ahead,
-                                                 batch_size = self.batch_size)
+                                                 batch_size = self.batch_size,
+                                                 shuffle = self.shuffle)
         self.validation_generator = make_sequence_generator(self.keras,
                                                             self.X_test_s,
                                                             self.make_multi_step_targets(self.Y_test_s),
