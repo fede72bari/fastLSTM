@@ -23,7 +23,7 @@ Typical uses: price/return forecasting, direction (up/down) classification, mult
 
 ---
 
-**Current version: 2.1.0** (`fastLSTM.__version__`) — see the [CHANGELOG](CHANGELOG.md).
+**Current version: 2.2.0** (`fastLSTM.__version__`) — see the [CHANGELOG](CHANGELOG.md).
 
 ## Contents
 
@@ -216,6 +216,7 @@ print(model.backend)                                               # 'torch'
 | `metrics` | `list` of `str` (or `str`) | `['accuracy']` | Metrics logged by Keras (validation ones get the `val_` prefix). |
 | `batch_size` | `int` | `128` | Batch size of the generators (can be overridden in `network_training`). |
 | `class_weight` | `dict` | `None` | e.g. `{0: 1.0, 1: 3.0}` to rebalance classes. Meaningful with a single output. |
+| `sequence_groups` | array-like | `None` | Group label of each row (e.g. option contract id) when the rows hold several interleaved series: windows and multi-step targets use only rows of the same group, so a sample never mixes two contracts. Rows must be chronological. Not saved in the files: pass it again after `load_all`. |
 | `shuffle` | `bool` | `False` | Permute the training windows among the batches at every epoch. Each window (its `timesteps` rows in chronological order, and its targets) is unchanged and the train/test split stays chronological; the test set is never shuffled. Recommended for autocorrelated targets (trend/ZigZag labels): in chronological order each batch holds consecutive days, often of a single class, and the learning curves jump from epoch to epoch. |
 | `history_metrics` | `list` of `str` | `None` | Columns plotted by `plot_training_history()`. `None` → `['loss', 'val_loss']` for regressors, first metric and its `val_` version for classificators. |
 
@@ -494,6 +495,7 @@ Same names and workflow; LSTM-specific: `LSTM_type`, `timesteps`, `steps_ahead`,
 - `timesteps` passed to `network_training` must equal the one used to build the network; to change it call `network_structure_set_compile(timesteps)` first.
 - Each set must contain more than `timesteps + steps_ahead - 1` rows.
 - `binary_precision_recall_vs_scoring` and the `report` returned by `network_predictions_evaluation` refer to the **last** output (last target column, last step).
+- With `sequence_groups` (e.g. an option chain: one row per contract and time) each sample is a window of the same contract; `validation_targets()` returns the actual targets aligned with `model.predict(validation_generator)` in both modes.
 - `shuffle = True` never mixes past and future: it only changes which windows share a batch. Keep it off if you need the exact behaviour of versions < 2.1.
 - `class_weight` with more than one output is applied by Keras to the argmax of each target row: a warning is shown.
 - Inside Jupyter the plots appear inline; in scripts call `matplotlib.pyplot.show()` after `plot_training_history()`.

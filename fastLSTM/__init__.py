@@ -29,7 +29,7 @@ Typical workflow
 >>> lstm.network_predictions_evaluation(min_probability = 0.5)
 """
 
-__version__ = '2.1.0'
+__version__ = '2.2.0'
 
 # ---------------------------------------------------------------------------
 #                              Libraries Import
@@ -297,7 +297,124 @@ def make_sequence_generator(keras, data, targets, length, batch_size, end_index 
             if(shuffle):
                 self.rng.shuffle(self.target_rows)
 
-    return SequenceGenerator()
+    generator = SequenceGenerator()
+    # target row of each sample in serving order without shuffling (used to align predictions and actual targets)
+    generator.sample_target_rows = np.arange(length, last_index + 1)
+    return generator
+
+
+def make_grouped_sequence_generator(keras, data, targets, length, batch_size, groups, steps_ahead = 1,
+                                    shuffle = False, seed = 42):
+    """
+    Batches of (sequence, target) samples whose windows never cross groups.
+
+    Use it when the rows hold several interleaved series, e.g. an option
+    chain where each row is one contract at one time: the window of a sample
+    is made of the ``length`` previous rows OF THE SAME GROUP (contract), in
+    the order in which they appear in ``data`` (that must be chronological),
+    and its targets are the target row and the following
+    ``steps_ahead - 1`` rows of the same group. A group contributes
+    ``n_rows_of_group - length - steps_ahead + 1`` samples (none if it is
+    too short).
+
+    Parameters
+    ----------
+    keras : module
+        The Keras module (see :func:`load_keras`).
+    data : numpy.ndarray
+        Features, shape ``(n_rows, n_features)``, rows in chronological order.
+    targets : numpy.ndarray
+        Targets, shape ``(n_rows, n_targets)`` (single step: the multi-step
+        targets are built here, step-major, within each group).
+    length : int
+        Number of rows of each window (``timesteps``).
+    batch_size : int
+        Number of samples per batch.
+    groups : array-like
+        Group label of each row (e.g. contract id), length ``n_rows``.
+    steps_ahead : int, default 1
+        Number of consecutive target rows of the group predicted per sample.
+    shuffle : bool, default False
+        Permute the samples among the batches at every epoch (windows are
+        unchanged). Never use it for a validation/test generator.
+    seed : int, default 42
+        Seed of the permutations.
+
+    Returns
+    -------
+    keras.utils.PyDataset
+        ``generator[i]`` returns ``(X_batch, Y_batch)`` with ``X_batch`` of
+        shape ``(batch, length, n_features)`` and ``Y_batch`` of shape
+        ``(batch, steps_ahead * n_targets)``. ``generator.sample_target_rows``
+        is the ``(n_samples, steps_ahead)`` array of target rows of each
+        sample in unshuffled order.
+
+    Raises
+    ------
+    ValueError
+        If ``groups`` has a different length from ``data`` or no group is
+        long enough to give a sample.
+    """
+    data = np.asarray(data, dtype = np.float32)
+    targets = np.asarray(targets, dtype = np.float32)
+    groups = np.asarray(groups)
+    if(len(groups) != len(data)):
+        raise ValueError(f'groups has {len(groups)} labels but data has {len(data)} rows.')
+
+    # rows of each group in data order (stable sort keeps the chronological order inside a group)
+    order = np.argsort(pd.factorize(groups)[0], kind = 'stable')
+    codes = pd.factorize(groups)[0][order]
+    starts = np.flatnonzero(np.r_[True, codes[1:] != codes[:-1]])
+    ends = np.r_[starts[1:], len(order)]
+
+    window_rows, target_rows = [], []
+    span = length + steps_ahead
+    for start, end in zip(starts, ends):
+        rows = order[start:end]
+        n_samples = len(rows) - span + 1
+        if(n_samples <= 0):
+            continue
+        # sliding windows over the rows of the group: first `length` are the inputs, the rest the targets
+        windows = np.lib.stride_tricks.sliding_window_view(rows, span)
+        window_rows.append(windows[:, :length])
+        target_rows.append(windows[:, length:])
+
+    if(len(window_rows) == 0):
+        raise ValueError(f'No group has at least {span} rows (timesteps {length} + steps_ahead {steps_ahead}).')
+
+    window_rows = np.concatenate(window_rows)
+    target_rows = np.concatenate(target_rows)
+    # samples sorted by the time of their first target row: unshuffled batches follow the chronology
+    chronological = np.argsort(target_rows[:, 0], kind = 'stable')
+    window_rows, target_rows = window_rows[chronological], target_rows[chronological]
+
+    class GroupedSequenceGenerator(keras.utils.PyDataset):
+
+        def __init__(self):
+            super().__init__()
+            self.samples = np.arange(len(window_rows))
+            self.rng = np.random.default_rng(seed)
+            if(shuffle):
+                self.rng.shuffle(self.samples)
+
+        def __len__(self):
+            return (len(window_rows) + batch_size - 1) // batch_size
+
+        def __getitem__(self, index):
+            if(index < 0):
+                index += len(self)
+            samples = self.samples[index * batch_size:(index + 1) * batch_size]
+            # step-major targets: all targets of step 1, then all targets of step 2, ...
+            Y_batch = targets[target_rows[samples]].reshape(len(samples), -1)
+            return data[window_rows[samples]], Y_batch
+
+        def on_epoch_end(self):
+            if(shuffle):
+                self.rng.shuffle(self.samples)
+
+    generator = GroupedSequenceGenerator()
+    generator.sample_target_rows = target_rows
+    return generator
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +587,15 @@ class fastLSTM:
         the training set, which makes the learning curves jump. The test
         generator is never shuffled. ``False`` keeps the behaviour of the
         previous versions.
+    sequence_groups : array-like, optional
+        Group label of each row of ``X_data`` (e.g. the option contract id)
+        when the rows hold several interleaved series. Windows and multi-step
+        targets are then built only from rows of the same group
+        (:func:`make_grouped_sequence_generator`), so a sample never mixes two
+        contracts. The rows must be in chronological order (the train/test
+        split stays the first/last ``train_size_rate`` of the rows). Not
+        stored in the saved files: pass it again after :meth:`load_all`
+        (attribute ``sequence_groups``) before using the generators.
     backend : {'tensorflow', 'torch'}, optional
         Deep learning framework that runs the network (through Keras 3).
         ``None`` (default) keeps the backend already active in the Python
@@ -574,6 +700,7 @@ class fastLSTM:
                  steps_ahead = 1,
                  class_weight = None,
                  shuffle = False,
+                 sequence_groups = None,
                  backend = None,
                  **legacy_kwargs):
 
@@ -617,6 +744,7 @@ class fastLSTM:
         self.batch_size = batch_size
         self.class_weight = class_weight
         self.shuffle = shuffle
+        self.sequence_groups = None if sequence_groups is None else np.asarray(sequence_groups)
 
         self.hyperparameters_file_name = None
 
@@ -822,6 +950,8 @@ class fastLSTM:
                                'steps_ahead': self.steps_ahead,
                                'class_weight': class_weight,
                                'shuffle': self.shuffle,
+                               # the labels are not saved (see sequence_groups): only whether they were used
+                               'sequence_groups': getattr(self, 'sequence_groups', None) is not None,
                                # informative: saved models can be reloaded with either backend
                                'backend': self.backend
                               }
@@ -1319,6 +1449,17 @@ class fastLSTM:
         if(batch_size is not None):
             self.batch_size = batch_size
 
+        if(getattr(self, 'sequence_groups', None) is not None):
+            # windows and targets inside each group (e.g. option contract), never across two groups
+            self.generator = make_grouped_sequence_generator(self.keras, self.X_train_s, self.Y_train_s,
+                                                             length = self.timesteps, batch_size = self.batch_size,
+                                                             groups = self.groups_train, steps_ahead = self.steps_ahead,
+                                                             shuffle = self.shuffle)
+            self.validation_generator = make_grouped_sequence_generator(self.keras, self.X_test_s, self.Y_test_s,
+                                                                        length = self.timesteps, batch_size = self.batch_size,
+                                                                        groups = self.groups_test, steps_ahead = self.steps_ahead)
+            return
+
         # the last target row usable is the one that still has steps_ahead - 1 rows after it
         self.generator = make_sequence_generator(self.keras,
                                                  self.X_train_s,
@@ -1769,6 +1910,35 @@ class fastLSTM:
         print("Load all completed.")
 
 
+    def validation_targets(self):
+        """
+        Actual (unscaled) targets of the validation samples, aligned with ``model.predict(validation_generator)``.
+
+        Without ``sequence_groups`` the generator skips the first
+        ``timesteps`` test rows and the last ``steps_ahead - 1``; with groups
+        the samples are the ones of :func:`make_grouped_sequence_generator`.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape ``(n_samples, steps_ahead * n_targets)``, step-major (same
+            order as the network outputs, see :meth:`output_column_names`).
+
+        Examples
+        --------
+        >>> Y_true = lstm.validation_targets()
+        >>> Y_pred = lstm.model.predict(lstm.validation_generator)
+        """
+        if(self.validation_generator is None):
+            self.create_generators()
+        rows = np.asarray(self.validation_generator.sample_target_rows)
+        Y_values = self.Y_test.values
+        if(rows.ndim == 1):
+            # first target row of each sample: steps 1 ... steps_ahead are the following rows
+            rows = rows[:, None] + np.arange(self.steps_ahead)[None, :]
+        return Y_values[rows].reshape(len(rows), -1)
+
+
     def network_predictions_evaluation(self, min_probability, output_dict = False):
         """
         Evaluate a binary classificator on the test set.
@@ -1813,11 +1983,7 @@ class fastLSTM:
         predictions_df = pd.DataFrame(predictions.reshape(predictions.shape[0], -1))
         filtered_predictions_results_df = pd.DataFrame()
 
-        # actual targets of each sample: the generator skips the first `timesteps` test rows and,
-        # with steps_ahead > 1, the last steps_ahead - 1 rows (no complete future)
-        Y_test_multi = self.make_multi_step_targets(self.Y_test.values)
-        Y_test = pd.DataFrame(Y_test_multi[self.timesteps:len(Y_test_multi) - self.steps_ahead + 1],
-                              columns = self.output_column_names())
+        Y_test = pd.DataFrame(self.validation_targets(), columns = self.output_column_names())
 
         print(f'len predictions {len(predictions_df)}')
         print(f'len Y_test (without the first {self.timesteps} rows) {len(Y_test)}')
@@ -1978,6 +2144,13 @@ class fastLSTM:
         self.Y_train = self.Y_data.head(train_size)
         self.X_test = self.X_data.tail(test_size)
         self.Y_test = self.Y_data.tail(test_size)
+
+        groups = getattr(self, 'sequence_groups', None)
+        if(groups is not None):
+            if(len(groups) != len(self.X_data)):
+                raise ValueError(f'sequence_groups has {len(groups)} labels but X_data has {len(self.X_data)} rows.')
+            self.groups_train = groups[:train_size]
+            self.groups_test = groups[train_size:]
 
         # scale
         if(scaler_fit == True):

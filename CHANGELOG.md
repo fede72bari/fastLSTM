@@ -4,6 +4,19 @@ All notable changes to `fastLSTM` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] - 2026-10-02
+
+### Added
+- `sequence_groups` parameter and `make_grouped_sequence_generator()`: for
+  datasets whose rows hold several interleaved series (e.g. option chains,
+  one row per contract and time) the windows and the multi-step targets are
+  built only from rows of the same group, so a sample never mixes two
+  contracts. The train/test split stays chronological.
+- `validation_targets()`: actual targets aligned with
+  `model.predict(validation_generator)`, with or without groups;
+  `network_predictions_evaluation()` uses it.
+- Generators expose `sample_target_rows` (target rows of each sample).
+
 ## [2.1.0] - 2026-10-02
 
 ### Added
