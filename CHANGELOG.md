@@ -4,6 +4,19 @@ All notable changes to `fastLSTM` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] - 2026-10-02
+
+### Fixed
+- `metrics=['accuracy']` on a model with several outputs (multi-step targets or several
+  binary targets) was resolved by Keras 3 to
+  `CategoricalAccuracy`, which compares only the arg-max of the outputs: on
+  sigmoid outputs this reports meaningless, much too high values (a constant
+  model scored about 0.92 instead of about 0.47) and misled early stopping and
+  checkpointing on `val_accuracy`. The new `compile_metrics()` method maps
+  `'accuracy'`/`'acc'` to `BinaryAccuracy` with sigmoid and to
+  `CategoricalAccuracy` with softmax, keeping the logged name `accuracy`.
+  Applied both when compiling and when loading a model.
+
 ## [2.0.0] - 2026-10-02
 
 Major release: API aligned with the sister package `fastANN`, real multi-step
