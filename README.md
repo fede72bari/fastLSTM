@@ -23,6 +23,8 @@ Typical uses: price/return forecasting, direction (up/down) classification, mult
 
 ---
 
+**Current version: 2.0.0** (`fastLSTM.__version__`) — see the [CHANGELOG](CHANGELOG.md).
+
 ## Contents
 
 1. [Installation](#installation)
