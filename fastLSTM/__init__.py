@@ -29,7 +29,7 @@ Typical workflow
 >>> lstm.network_predictions_evaluation(min_probability = 0.5)
 """
 
-__version__ = '2.3.0'
+__version__ = '2.4.0'
 
 # ---------------------------------------------------------------------------
 #                              Libraries Import
@@ -217,7 +217,315 @@ def load_keras(backend = None):
     return keras
 
 
-def make_sequence_generator(keras, data, targets, length, batch_size, end_index = None, shuffle = False, seed = 42):
+# custom layers are registered under the name of the sister package that defines them, so .keras files are
+# interchangeable with fastANN and fastGatedFourierAnalysisNetwork
+KERAS_PACKAGE = 'fastGatedFourierAnalysisNetwork'
+
+
+# ---------------------------------------------------------------------------
+#                       Gated FAN layer (Keras 3, any backend)
+# ---------------------------------------------------------------------------
+
+# The layer classes need the keras module, which is imported only when the first instance is created (the backend
+# must be chosen first). fan_layers() defines and registers them once and caches them here.
+_FAN_OBJECTS = {}
+
+
+def periodic_split(units, periodic_share):
+    """
+    Number of frequencies and of non-periodic units of a gated FAN layer.
+
+    The layer output has ``units`` values: ``2 * d_p`` periodic ones (a cosine
+    and a sine for each of the ``d_p`` frequencies) and ``d_p_bar``
+    non-periodic ones, with ``2 * d_p`` as close as possible to
+    ``units * periodic_share``.
+
+    Parameters
+    ----------
+    units : int
+        Output width of the layer.
+    periodic_share : float
+        Share (0 - 1) of the output given to the periodic part. 0 gives a
+        plain dense layer (no frequencies, no gate).
+
+    Returns
+    -------
+    d_p : int
+        Number of learned frequencies (cosine + sine pairs).
+    d_p_bar : int
+        Number of non-periodic units.
+
+    Raises
+    ------
+    ValueError
+        If ``periodic_share`` is outside [0, 1) or ``units`` is too small to
+        hold both parts.
+
+    Examples
+    --------
+    >>> periodic_split(368, 1 / 3)
+    (61, 246)
+    """
+    if(not (0 <= periodic_share < 1)):
+        raise ValueError(f'periodic_share must be in [0, 1), not {periodic_share}.')
+
+    units = int(units)
+    d_p = int(round(units * periodic_share / 2))
+
+    if((periodic_share > 0) and (d_p == 0)):
+        d_p = 1
+
+    d_p_bar = units - 2 * d_p
+
+    if(d_p_bar < 1):
+        raise ValueError(f'A layer of {units} units cannot hold {2 * d_p} periodic units and at least one '
+                         f'non-periodic unit: increase model_relative_width or reduce periodic_share.')
+
+    return d_p, d_p_bar
+
+
+def fan_layers(keras = None):
+    """
+    Define (once) and return the custom Keras objects of the package.
+
+    Returns the dictionary ``{'GatedFAN': <layer class>, 'FrequencyClip':
+    <constraint class>}``. The classes are registered in the Keras
+    serialization registry (package ``'fastGatedFourierAnalysisNetwork'``), so
+    saved ``.keras`` files reload with ``keras.models.load_model`` once this
+    function has been called; :meth:`fastGatedFourierAnalysisNetwork.load_model`
+    does it automatically. The dictionary can also be passed as
+    ``custom_objects``.
+
+    Parameters
+    ----------
+    keras : module, optional
+        The ``keras`` module; defaults to :func:`load_keras` ``()``.
+
+    Returns
+    -------
+    dict
+        Custom objects by name.
+
+    Examples
+    --------
+    >>> objects = fan_layers()
+    >>> layer = objects['GatedFAN'](units = 96)
+    """
+    if(_FAN_OBJECTS):
+        return _FAN_OBJECTS
+
+    if(keras is None):
+        keras = load_keras()
+
+    ops = keras.ops
+
+
+    @keras.saving.register_keras_serializable(package = KERAS_PACKAGE)
+    class FrequencyClip(keras.constraints.Constraint):
+        """
+        Keep the absolute value of every frequency inside ``[min_frequency, max_frequency]``.
+
+        Applied by the optimizer after each update; the sign of each weight is
+        kept. ``None`` leaves that side unbounded.
+        """
+
+        def __init__(self, min_frequency = None, max_frequency = None):
+            self.min_frequency = None if min_frequency is None else float(min_frequency)
+            self.max_frequency = None if max_frequency is None else float(max_frequency)
+
+        def __call__(self, w):
+            magnitude = ops.abs(w)
+
+            if(self.min_frequency is not None):
+                magnitude = ops.maximum(magnitude, self.min_frequency)
+
+            if(self.max_frequency is not None):
+                magnitude = ops.minimum(magnitude, self.max_frequency)
+
+            # a weight exactly 0 has sign 0: it is sent to +min_frequency
+            sign = ops.where(w >= 0, 1.0, -1.0)
+            return sign * magnitude
+
+        def get_config(self):
+            return {'min_frequency': self.min_frequency, 'max_frequency': self.max_frequency}
+
+
+    @keras.saving.register_keras_serializable(package = KERAS_PACKAGE)
+    class GatedFAN(keras.layers.Layer):
+        """
+        Gated Fourier Analysis Network layer.
+
+        Output (``units`` values)::
+
+            [ g * cos(x Wp) , g * sin(x Wp) , (1 - mean(g)) * act(x Wp_bar + b) ]
+
+        * ``Wp`` (``n_inputs x d_p``): learned frequencies. Each periodic unit
+          is a sinusoid along a learned direction of the input, with period
+          ``2 * pi / |Wp[:, j]|`` in input units.
+        * ``g = sigmoid(gate)``: one trainable gate per frequency (starts at
+          0.5). It scales the cosine and sine of that frequency; the
+          non-periodic part is scaled by ``1 - mean(g)``, so the layer can
+          move its capacity between periodic and non-periodic modelling.
+        * ``Wp_bar``, ``b``: an ordinary dense layer with activation ``act``.
+
+        With ``gated = False`` the gate is not created and ``g = 1``, ``1 -
+        mean(g)`` is replaced by 1 (plain FAN layer). With ``periodic_share =
+        0`` the layer is a plain dense layer.
+
+        Parameters
+        ----------
+        units : int
+            Output width.
+        periodic_share : float, default 1/3
+            Share of the output given to the cosine + sine pairs (see
+            :func:`periodic_split`).
+        activation : str, default 'gelu'
+            Keras activation of the non-periodic part.
+        gated : bool, default True
+            Create the trainable gates.
+        frequency_init_std : float, default 1.0
+            Standard deviation of the normal initialisation of ``Wp``. With
+            standardized inputs, 1 gives periods of a few standard deviations
+            (random Fourier features); use larger values for faster cycles.
+        min_frequency, max_frequency : float, optional
+            Bounds of ``|Wp|`` (enforced with :class:`FrequencyClip`), e.g.
+            to forbid periods longer than the training window.
+        """
+
+        def __init__(self, units, periodic_share = 1 / 3, activation = 'gelu', gated = True,
+                     frequency_init_std = 1.0, min_frequency = None, max_frequency = None, **kwargs):
+            super().__init__(**kwargs)
+            self.units = int(units)
+            self.periodic_share = float(periodic_share)
+            self.activation_name = activation
+            self.activation = keras.activations.get(activation)
+            self.gated = bool(gated)
+            self.frequency_init_std = float(frequency_init_std)
+            self.min_frequency = min_frequency
+            self.max_frequency = max_frequency
+            self.d_p, self.d_p_bar = periodic_split(self.units, self.periodic_share)
+
+        def build(self, input_shape):
+            n_inputs = int(input_shape[-1])
+
+            if(self.d_p > 0):
+                constraint = None
+                if((self.min_frequency is not None) or (self.max_frequency is not None)):
+                    constraint = FrequencyClip(self.min_frequency, self.max_frequency)
+
+                self.Wp = self.add_weight(name = 'Wp', shape = (n_inputs, self.d_p),
+                                          initializer = keras.initializers.RandomNormal(0.0, self.frequency_init_std),
+                                          constraint = constraint, trainable = True)
+
+                if(self.gated):
+                    # sigmoid(0) = 0.5: periodic and non-periodic parts start with the same weight
+                    self.gate = self.add_weight(name = 'gate', shape = (self.d_p,), initializer = 'zeros', trainable = True)
+
+            self.Wp_bar = self.add_weight(name = 'Wp_bar', shape = (n_inputs, self.d_p_bar), initializer = 'glorot_uniform', trainable = True)
+            self.b = self.add_weight(name = 'b', shape = (self.d_p_bar,), initializer = 'zeros', trainable = True)
+
+        def call(self, x):
+            non_periodic = self.activation(ops.matmul(x, self.Wp_bar) + self.b)
+
+            if(self.d_p == 0):
+                return non_periodic
+
+            wx = ops.matmul(x, self.Wp)
+
+            if(self.gated):
+                g = ops.sigmoid(self.gate)
+                periodic = ops.concatenate([g * ops.cos(wx), g * ops.sin(wx)], axis = -1)
+                non_periodic = (1.0 - ops.mean(g)) * non_periodic
+            else:
+                periodic = ops.concatenate([ops.cos(wx), ops.sin(wx)], axis = -1)
+
+            return ops.concatenate([periodic, non_periodic], axis = -1)
+
+        def compute_output_shape(self, input_shape):
+            return tuple(input_shape[:-1]) + (self.units,)
+
+        def gate_values(self):
+            """Gates ``g`` (numpy array of ``d_p`` values; ones when the layer is not gated, empty without periodic part)."""
+            if(self.d_p == 0):
+                return np.array([])
+            if(not self.gated):
+                return np.ones(self.d_p)
+            return keras.ops.convert_to_numpy(ops.sigmoid(self.gate))
+
+        def periods(self):
+            """Period of each sinusoid along its own direction, ``2 * pi / |Wp[:, j]|``, in units of the (scaled) input."""
+            if(self.d_p == 0):
+                return np.array([])
+            w = keras.ops.convert_to_numpy(self.Wp)
+            return 2 * np.pi / np.maximum(np.linalg.norm(w, axis = 0), 1e-12)
+
+        def get_config(self):
+            config = super().get_config()
+            config.update({'units': self.units, 'periodic_share': self.periodic_share, 'activation': self.activation_name,
+                           'gated': self.gated, 'frequency_init_std': self.frequency_init_std,
+                           'min_frequency': self.min_frequency, 'max_frequency': self.max_frequency})
+            return config
+
+
+    _FAN_OBJECTS.update({'GatedFAN': GatedFAN, 'FrequencyClip': FrequencyClip})
+    return _FAN_OBJECTS
+
+
+def make_auc_callback(keras, predict, y_true, rows_mask = None, name = 'val_monitored_auc'):
+    """
+    Keras callback that adds the ROC AUC of the validation predictions to the logs of every epoch.
+
+    The value is written into the epoch logs under ``name`` BEFORE early
+    stopping and checkpoint read them (the callback must come first in the
+    callbacks list), so it can be used as ``early_stop_monitor_metric`` /
+    ``checkpoint_monitor_metric`` (mode ``'max'``) and appears in the
+    training history. With several outputs (several binary targets or
+    steps) the AUC is computed on all the outputs pooled together.
+
+    Parameters
+    ----------
+    keras : module
+        The Keras module (see :func:`load_keras`).
+    predict : callable
+        Function without arguments returning the validation predictions,
+        shape ``(n_samples, n_outputs)``.
+    y_true : array-like
+        Actual 0/1 targets aligned with the predictions.
+    rows_mask : array-like of bool, optional
+        Samples on which the AUC is computed (e.g. the hard cases); all
+        samples when ``None``.
+    name : str, default 'val_monitored_auc'
+        Key of the value in the logs and in the training history.
+
+    Returns
+    -------
+    keras.callbacks.Callback
+        The callback; NaN is logged when the selected samples contain one
+        class only.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    y_true = np.asarray(y_true, dtype = float)
+    y_true = y_true.reshape(len(y_true), -1)
+    mask = np.ones(len(y_true), dtype = bool) if rows_mask is None else np.asarray(rows_mask, dtype = bool)
+    if(len(mask) != len(y_true)):
+        raise ValueError(f'rows_mask has {len(mask)} values but there are {len(y_true)} validation samples.')
+
+    class MonitoredAUC(keras.callbacks.Callback):
+
+        def on_epoch_end(self, epoch, logs = None):
+            predictions = np.asarray(predict(), dtype = float).reshape(len(y_true), -1)
+            selected_true, selected_pred = y_true[mask].ravel(), predictions[mask].ravel()
+            auc = roc_auc_score(selected_true, selected_pred) if len(np.unique(selected_true)) == 2 else float('nan')
+            if(logs is not None):
+                logs[name] = auc
+            print(f' - {name}: {auc:.4f} ({int(mask.sum())} samples)')
+
+    return MonitoredAUC()
+
+
+def make_sequence_generator(keras, data, targets, length, batch_size, end_index = None, shuffle = False, seed = 42,
+                            sample_weights = None):
     """
     Batches of (sequence, target) samples for Keras, on any backend.
 
@@ -249,13 +557,16 @@ def make_sequence_generator(keras, data, targets, length, batch_size, end_index 
         be aligned with the dates.
     seed : int, default 42
         Seed of the permutations (reproducible runs).
+    sample_weights : array-like, optional
+        One weight per row of ``data``: each sample gets the weight of its
+        target row and the batches become ``(X_batch, Y_batch, w_batch)``.
 
     Returns
     -------
     keras.utils.PyDataset
         Object with ``len(generator)`` batches; ``generator[i]`` returns
-        ``(X_batch, Y_batch)`` with ``X_batch`` of shape
-        ``(batch, length, n_features)``.
+        ``(X_batch, Y_batch)`` (plus the weights, see ``sample_weights``)
+        with ``X_batch`` of shape ``(batch, length, n_features)``.
 
     Raises
     ------
@@ -264,6 +575,9 @@ def make_sequence_generator(keras, data, targets, length, batch_size, end_index 
     """
     data = np.asarray(data, dtype = np.float32)
     targets = np.asarray(targets, dtype = np.float32)
+    weights = None if sample_weights is None else np.asarray(sample_weights, dtype = np.float32)
+    if((weights is not None) and (len(weights) != len(data))):
+        raise ValueError(f'sample_weights has {len(weights)} values but data has {len(data)} rows.')
     last_index = len(data) - 1 if end_index is None else end_index
 
     if(length > last_index):
@@ -290,6 +604,8 @@ def make_sequence_generator(keras, data, targets, length, batch_size, end_index 
             rows = self.target_rows[index * batch_size:(index + 1) * batch_size]
             # sample for target row r: the `length` rows before r, in chronological order
             X_batch = np.stack([data[row - length:row] for row in rows])
+            if(weights is not None):
+                return X_batch, targets[rows], weights[rows]
             return X_batch, targets[rows]
 
         def on_epoch_end(self):
@@ -304,7 +620,7 @@ def make_sequence_generator(keras, data, targets, length, batch_size, end_index 
 
 
 def make_grouped_sequence_generator(keras, data, targets, length, batch_size, groups, steps_ahead = 1,
-                                    shuffle = False, seed = 42):
+                                    shuffle = False, seed = 42, sample_weights = None):
     """
     Batches of (sequence, target) samples whose windows never cross groups.
 
@@ -339,6 +655,10 @@ def make_grouped_sequence_generator(keras, data, targets, length, batch_size, gr
         unchanged). Never use it for a validation/test generator.
     seed : int, default 42
         Seed of the permutations.
+    sample_weights : array-like, optional
+        One weight per row of ``data``: each sample gets the weight of its
+        first target row and the batches become ``(X_batch, Y_batch,
+        w_batch)``.
 
     Returns
     -------
@@ -360,6 +680,9 @@ def make_grouped_sequence_generator(keras, data, targets, length, batch_size, gr
     groups = np.asarray(groups)
     if(len(groups) != len(data)):
         raise ValueError(f'groups has {len(groups)} labels but data has {len(data)} rows.')
+    weights = None if sample_weights is None else np.asarray(sample_weights, dtype = np.float32)
+    if((weights is not None) and (len(weights) != len(data))):
+        raise ValueError(f'sample_weights has {len(weights)} values but data has {len(data)} rows.')
 
     # rows of each group in data order (stable sort keeps the chronological order inside a group)
     order = np.argsort(pd.factorize(groups)[0], kind = 'stable')
@@ -406,6 +729,8 @@ def make_grouped_sequence_generator(keras, data, targets, length, batch_size, gr
             samples = self.samples[index * batch_size:(index + 1) * batch_size]
             # step-major targets: all targets of step 1, then all targets of step 2, ...
             Y_batch = targets[target_rows[samples]].reshape(len(samples), -1)
+            if(weights is not None):
+                return data[window_rows[samples]], Y_batch, weights[target_rows[samples, 0]]
             return data[window_rows[samples]], Y_batch
 
         def on_epoch_end(self):
@@ -603,6 +928,48 @@ class fastLSTM:
         (``'tensorflow'`` when it is not set). The backend is fixed for the
         whole process by the first instance: to change it restart the kernel.
         Saved models can be reloaded with either backend.
+    input_projection : {None, 'gated_fan'}, default None
+        ``'gated_fan'`` adds, between the input and the first LSTM, a gated
+        Fourier Analysis Network layer applied to every row (bar) of the
+        window: ``[g cos(xWp), g sin(xWp), (1 - mean(g)) act(xWp_bar + b)]``,
+        i.e. learned periodic components (cycles of the features and phases)
+        and a normal dense part, followed by ``input_projection_dropout``.
+        The LSTM layers stay standard (fast cuDNN kernels on GPU). Same layer
+        as the sister package ``fastGatedFourierAnalysisNetwork``.
+    input_projection_width : float, default 4
+        Output width of the projection, relative to the number of features.
+        The LSTM widths (``model_relative_width``) stay relative to the
+        number of FEATURES, not to the projection width.
+    input_projection_dropout : float, default 0.0
+        Dropout after the projection.
+    input_projection_activation : str, default 'gelu'
+        Activation of the non-periodic part of the projection.
+    periodic_share : float, default 1/3
+        Share of the projection outputs given to the cosine + sine pairs.
+    gated : bool, default True
+        Trainable gate per frequency; ``False`` gives the ungated FAN layer.
+    frequency_init_std : float, default 1.0
+        Standard deviation of the normal initialisation of the frequencies
+        (inputs are standardized).
+    sample_weight : array-like, optional
+        One weight per row of ``X_data``; the rows of the training set weight
+        the loss of their samples (each sample takes the weight of its first
+        target row), e.g. larger weights for the hard cases (options with the
+        strike close to the underlying). Validation is not weighted. Cannot
+        be combined with ``class_weight``. Not stored in the saved files
+        (only whether it was used).
+    monitor_auc : bool, default False
+        Compute the ROC AUC of the validation predictions at the end of every
+        epoch (binary targets) and log it as ``'val_monitored_auc'``: use it
+        as ``early_stop_monitor_metric`` / ``checkpoint_monitor_metric`` with
+        mode ``'max'`` to choose the epoch on the AUC instead of the loss or
+        the accuracy. Costs one extra prediction pass on the validation set
+        per epoch.
+    monitor_auc_rows : array-like of bool, optional
+        One value per row of ``X_data``: the AUC is computed only on the
+        validation samples whose (first) target row is ``True`` (e.g. strike
+        within 2% of the underlying). Implies ``monitor_auc = True``. Not
+        stored in the saved files (only whether it was used).
     **legacy_kwargs
         Old parameter names, still accepted for backward compatibility with
         a ``DeprecationWarning``: ``scaler`` (-> ``scaler_type``), ``metric``
@@ -701,6 +1068,16 @@ class fastLSTM:
                  class_weight = None,
                  shuffle = False,
                  sequence_groups = None,
+                 input_projection = None,
+                 input_projection_width = 4,
+                 input_projection_dropout = 0.0,
+                 input_projection_activation = 'gelu',
+                 periodic_share = 1 / 3,
+                 gated = True,
+                 frequency_init_std = 1.0,
+                 sample_weight = None,
+                 monitor_auc = False,
+                 monitor_auc_rows = None,
                  backend = None,
                  **legacy_kwargs):
 
@@ -745,6 +1122,21 @@ class fastLSTM:
         self.class_weight = class_weight
         self.shuffle = shuffle
         self.sequence_groups = None if sequence_groups is None else np.asarray(sequence_groups)
+        if(input_projection not in (None, 'gated_fan')):
+            raise ValueError(f"input_projection must be None or 'gated_fan', not '{input_projection}'.")
+        self.input_projection = input_projection
+        self.input_projection_width = input_projection_width
+        self.input_projection_dropout = input_projection_dropout
+        self.input_projection_activation = input_projection_activation
+        self.periodic_share = periodic_share
+        self.gated = gated
+        self.frequency_init_std = frequency_init_std
+        self.sample_weight = None if sample_weight is None else np.asarray(sample_weight, dtype = float)
+        self.monitor_auc_rows = None if monitor_auc_rows is None else np.asarray(monitor_auc_rows, dtype = bool)
+        # a rows mask implies the AUC monitor
+        self.monitor_auc = bool(monitor_auc) or (self.monitor_auc_rows is not None)
+        if((self.class_weight is not None) and (self.sample_weight is not None)):
+            raise ValueError('Use class_weight or sample_weight, not both (fold the class weights into sample_weight).')
 
         self.hyperparameters_file_name = None
 
@@ -952,6 +1344,17 @@ class fastLSTM:
                                'shuffle': self.shuffle,
                                # the labels are not saved (see sequence_groups): only whether they were used
                                'sequence_groups': getattr(self, 'sequence_groups', None) is not None,
+                               'input_projection': getattr(self, 'input_projection', None),
+                               'input_projection_width': getattr(self, 'input_projection_width', 4),
+                               'input_projection_dropout': getattr(self, 'input_projection_dropout', 0.0),
+                               'input_projection_activation': getattr(self, 'input_projection_activation', 'gelu'),
+                               'periodic_share': getattr(self, 'periodic_share', 1 / 3),
+                               'gated': getattr(self, 'gated', True),
+                               'frequency_init_std': getattr(self, 'frequency_init_std', 1.0),
+                               # arrays not saved, as sequence_groups: only whether they were used
+                               'sample_weight': getattr(self, 'sample_weight', None) is not None,
+                               'monitor_auc': getattr(self, 'monitor_auc', False),
+                               'monitor_auc_rows': getattr(self, 'monitor_auc_rows', None) is not None,
                                # informative: saved models can be reloaded with either backend
                                'backend': self.backend
                               }
@@ -1074,6 +1477,14 @@ class fastLSTM:
         self.class_weight = class_weight
         # files of versions < 2.1 do not store shuffle: they always trained in chronological order
         self.shuffle = self.get_hyperparameter('shuffle', False)
+        # files of versions < 2.4 have no input projection
+        self.input_projection = self.get_hyperparameter('input_projection', None)
+        self.input_projection_width = self.get_hyperparameter('input_projection_width', 4)
+        self.input_projection_dropout = self.get_hyperparameter('input_projection_dropout', 0.0)
+        self.input_projection_activation = self.get_hyperparameter('input_projection_activation', 'gelu')
+        self.periodic_share = self.get_hyperparameter('periodic_share', 1 / 3)
+        self.gated = self.get_hyperparameter('gated', True)
+        self.frequency_init_std = self.get_hyperparameter('frequency_init_std', 1.0)
 
         # callbacks depend on the loaded settings
         self.early_stop_patience_set(self.early_stop_patience)
@@ -1291,6 +1702,15 @@ class fastLSTM:
         # input layer: sequences of `timesteps` rows with `n_features` columns
         self.model.add(keras.Input(shape = (self.timesteps, n_features)))
 
+        if(getattr(self, 'input_projection', None) == 'gated_fan'):
+            # gated FAN projection of every row of the window (periodic + non-periodic parts), then the LSTMs
+            units = int(n_features * self.input_projection_width)
+            print(f'Input projection: gated FAN, {units} outputs, dropout {self.input_projection_dropout}')
+            self.model.add(fan_layers(keras)['GatedFAN'](units = units, periodic_share = self.periodic_share,
+                                                         activation = self.input_projection_activation, gated = self.gated,
+                                                         frequency_init_std = self.frequency_init_std, name = 'gated_fan_projection'))
+            self.model.add(keras.layers.Dropout(self.input_projection_dropout))
+
         # hidden layers
         for i in range(n_hidden_layers):
 
@@ -1454,7 +1874,8 @@ class fastLSTM:
             self.generator = make_grouped_sequence_generator(self.keras, self.X_train_s, self.Y_train_s,
                                                              length = self.timesteps, batch_size = self.batch_size,
                                                              groups = self.groups_train, steps_ahead = self.steps_ahead,
-                                                             shuffle = self.shuffle)
+                                                             shuffle = self.shuffle,
+                                                             sample_weights = getattr(self, 'sample_weight_train', None))
             self.validation_generator = make_grouped_sequence_generator(self.keras, self.X_test_s, self.Y_test_s,
                                                                         length = self.timesteps, batch_size = self.batch_size,
                                                                         groups = self.groups_test, steps_ahead = self.steps_ahead)
@@ -1467,13 +1888,38 @@ class fastLSTM:
                                                  length = self.timesteps,
                                                  end_index = len(self.X_train_s) - self.steps_ahead,
                                                  batch_size = self.batch_size,
-                                                 shuffle = self.shuffle)
+                                                 shuffle = self.shuffle,
+                                                 sample_weights = getattr(self, 'sample_weight_train', None))
         self.validation_generator = make_sequence_generator(self.keras,
                                                             self.X_test_s,
                                                             self.make_multi_step_targets(self.Y_test_s),
                                                             length = self.timesteps,
                                                             end_index = len(self.X_test_s) - self.steps_ahead,
                                                             batch_size = self.batch_size)
+
+
+    def auc_callbacks(self):
+        """
+        The validation AUC monitor (see ``monitor_auc``), as a list ready for ``fit``.
+
+        Returns
+        -------
+        list of keras.callbacks.Callback
+            Empty when ``monitor_auc`` is off; otherwise the callback built by
+            :func:`make_auc_callback` on the validation generator, restricted
+            to the samples whose first target row is selected by
+            ``monitor_auc_rows``.
+        """
+        if(not getattr(self, 'monitor_auc', False)):
+            return []
+
+        rows = np.asarray(self.validation_generator.sample_target_rows)
+        first_rows = rows if rows.ndim == 1 else rows[:, 0]
+        mask_test = getattr(self, 'monitor_auc_rows_test', None)
+        mask = None if mask_test is None else mask_test[first_rows]
+
+        return [make_auc_callback(self.keras, lambda: self.model.predict(self.validation_generator, verbose = 0),
+                                  self.validation_targets(), mask)]
 
 
     def network_training(self, epochs, batch_size = None, timesteps = None, callbacks = None):
@@ -1623,11 +2069,12 @@ class fastLSTM:
         if(self.class_weight is not None):
             print(f'Used class_weight: {self.class_weight}')
 
+        # the AUC monitor comes first: it writes val_monitored_auc into the logs read by early stopping and checkpoint
         history = self.model.fit(self.generator,
                                  epochs = epochs,
                                  validation_data = self.validation_generator,
                                  class_weight = self.class_weight,
-                                 callbacks = [self.early_stop, self.model_checkpoint] + list(callbacks or []))
+                                 callbacks = self.auc_callbacks() + [self.early_stop, self.model_checkpoint] + list(callbacks or []))
 
         # save history
         self.loss_df = pd.DataFrame(history.history)
@@ -1738,7 +2185,7 @@ class fastLSTM:
         # compile = False: the saved compile configuration can refer to backend-specific classes (e.g. the PyTorch
         # Adam optimizer) that cannot be loaded with the other backend. Architecture and weights are portable, so the
         # model is loaded without it and recompiled with the current loss, metrics and learning rate.
-        self.model = self.keras.models.load_model(model_file_path, compile = False)
+        self.model = self.keras.models.load_model(model_file_path, compile = False, custom_objects = fan_layers(self.keras))
         self.model.compile(optimizer = self.keras.optimizers.Adam(learning_rate = self.learning_rate),
                            loss = self.loss_function,
                            metrics = self.compile_metrics())
@@ -2155,6 +2602,12 @@ class fastLSTM:
                 raise ValueError(f'sequence_groups has {len(groups)} labels but X_data has {len(self.X_data)} rows.')
             self.groups_train = groups[:train_size]
             self.groups_test = groups[train_size:]
+
+        for name, values in [('sample_weight', getattr(self, 'sample_weight', None)), ('monitor_auc_rows', getattr(self, 'monitor_auc_rows', None))]:
+            if((values is not None) and (len(values) != len(self.X_data))):
+                raise ValueError(f'{name} has {len(values)} values but X_data has {len(self.X_data)} rows.')
+        self.sample_weight_train = None if getattr(self, 'sample_weight', None) is None else self.sample_weight[:train_size]
+        self.monitor_auc_rows_test = None if getattr(self, 'monitor_auc_rows', None) is None else self.monitor_auc_rows[train_size:]
 
         # scale
         if(scaler_fit == True):

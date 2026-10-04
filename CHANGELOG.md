@@ -4,6 +4,21 @@ All notable changes to `fastLSTM` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.4.0] - 2026-10-04
+
+### Added
+- `sample_weight`: one weight per row of `X_data`, applied to the training samples (each sample takes the weight
+  of its first target row; the generators then yield `(X, Y, w)`). Cannot be combined with `class_weight`.
+- `monitor_auc` and `monitor_auc_rows`: ROC AUC of the validation predictions computed at the end of every epoch,
+  optionally on a subset of rows, logged as `val_monitored_auc` and usable to choose the epoch with early stopping
+  and checkpoint (mode `'max'`). Module function `make_auc_callback()` and method `auc_callbacks()`.
+- `input_projection = 'gated_fan'` (with `input_projection_width`, `input_projection_dropout`,
+  `input_projection_activation`, `periodic_share`, `gated`, `frequency_init_std`): a gated Fourier Analysis Network
+  layer applied to every row of the window before the LSTMs (hybrid FAN + LSTM). Module function `fan_layers()`;
+  the layer is the one of `fastGatedFourierAnalysisNetwork` and saved models load in both packages.
+- The new settings are saved in the hyperparameters JSON (the weight and row arrays only as flags, as
+  `sequence_groups`).
+
 ## [2.3.0] - 2026-10-02
 
 ### Added

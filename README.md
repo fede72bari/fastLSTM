@@ -23,7 +23,7 @@ Typical uses: price/return forecasting, direction (up/down) classification, mult
 
 ---
 
-**Current version: 2.3.0** (`fastLSTM.__version__`) — see the [CHANGELOG](CHANGELOG.md).
+**Current version: 2.4.0** (`fastLSTM.__version__`) — see the [CHANGELOG](CHANGELOG.md).
 
 ## Contents
 
@@ -205,6 +205,11 @@ print(model.backend)                                               # 'torch'
 | `model_dropout` | `list` of `float` 0–1 | `[0]` | Dropout after each hidden layer (same length as `model_relative_width`). |
 | `LSTM_type` | `'classificator'`, `'regressor'` | `'classificator'` | Output layer type (see table above). |
 | `activation` | Keras activation name | `'tanh'` | Activation of the LSTM layers. `'tanh'` enables the fast cuDNN kernel on GPU. |
+| `input_projection` | `None`, `'gated_fan'` | `None` | `'gated_fan'` adds a gated Fourier Analysis Network layer applied to every bar of the window before the first LSTM: learned periodic components (cosines and sines of learned frequencies, scaled by trainable gates) next to a normal dense part. The LSTMs stay standard (cuDNN on GPU). Same layer as [fastGatedFourierAnalysisNetwork](https://github.com/fede72bari/fastGatedFourierAnalysisNetwork). |
+| `input_projection_width` | `float` | `4` | Width of the projection relative to the number of features (the LSTM widths stay relative to the number of features). |
+| `input_projection_dropout` | `float` 0–1 | `0.0` | Dropout after the projection. |
+| `input_projection_activation` | Keras activation name | `'gelu'` | Activation of the non-periodic part of the projection. |
+| `periodic_share`, `gated`, `frequency_init_std` | `float`, `bool`, `float` | `1/3`, `True`, `1.0` | Share of the projection given to the periodic part, trainable gates on/off, scale of the initial frequencies. |
 | `last_layer_activation` | `'sigmoid'`, `'softmax'`, … | `'sigmoid'` | Output activation of classificators. Use `'softmax'` only for one-hot classes with `steps_ahead = 1`. |
 
 ### Training
@@ -218,6 +223,9 @@ print(model.backend)                                               # 'torch'
 | `class_weight` | `dict` | `None` | e.g. `{0: 1.0, 1: 3.0}` to rebalance classes. Meaningful with a single output. |
 | `sequence_groups` | array-like | `None` | Group label of each row (e.g. option contract id) when the rows hold several interleaved series: windows and multi-step targets use only rows of the same group, so a sample never mixes two contracts. Rows must be chronological. Not saved in the files: pass it again after `load_all`. |
 | `shuffle` | `bool` | `False` | Permute the training windows among the batches at every epoch. Each window (its `timesteps` rows in chronological order, and its targets) is unchanged and the train/test split stays chronological; the test set is never shuffled. Recommended for autocorrelated targets (trend/ZigZag labels): in chronological order each batch holds consecutive days, often of a single class, and the learning curves jump from epoch to epoch. |
+| `sample_weight` | array-like | `None` | One weight per row of `X_data`: the training rows weight the loss (e.g. larger weights for the hard cases, such as options with the strike close to the underlying). Validation is not weighted. Not saved in the files (only whether it was used). |
+| `monitor_auc` | `bool` | `False` | Compute the ROC AUC of the validation predictions at the end of every epoch and log it as `val_monitored_auc` (binary targets). Use it as `early_stop_monitor_metric` / `checkpoint_monitor_metric` with mode `'max'` to choose the epoch on the AUC. One extra prediction pass on the validation set per epoch. |
+| `monitor_auc_rows` | array-like of `bool` | `None` | One value per row of `X_data`: the monitored AUC uses only the selected validation rows (e.g. strike within 2% of the underlying). Implies `monitor_auc = True`. Not saved in the files. |
 | `history_metrics` | `list` of `str` | `None` | Columns plotted by `plot_training_history()`. `None` → `['loss', 'val_loss']` for regressors, first metric and its `val_` version for classificators. |
 
 ### Early stopping and checkpoint
@@ -461,6 +469,36 @@ lstm.network_training(epochs = 200)
 importances, names = lstm.gradient_feature_importance()
 print(names[-5:])   # five most important features
 ```
+
+### 8. Choose the epoch on the AUC of the hard cases, and weight them more
+
+The loss and the accuracy are dominated by the easy rows; when what matters is how well the model ranks the hard cases, monitor the AUC on those rows and give them more weight:
+
+```python
+near = (df['STRIKE_DISTANCE_PCT'].abs() <= 0.02).values           # hard cases, one flag per row of X_df
+weights = np.where(near, 3.0, 1.0)                                  # 3x weight in the training loss
+
+model = fastLSTM(X_data = X_df, Y_data = Y_df[['itm']],
+            timesteps = 8, sequence_groups = df['CONTRACT'].values,
+            sample_weight = weights,
+            monitor_auc_rows = near,                                # logs val_monitored_auc on these rows
+            early_stop_monitor_metric = 'val_monitored_auc', early_stop_mode = 'max',
+            checkpoint_monitor_metric = 'val_monitored_auc', checkpoint_mode = 'max',
+            early_stop_patience = 10, data_storage_path = './models/')
+```
+
+AUC is a ranking measure and is not differentiable, so it is not used as the loss: the network is still trained with its loss (weighted), and the AUC chooses the epoch to keep.
+
+### 9. Gated FAN projection + LSTM (hybrid)
+
+```python
+lstm = fastLSTM(X_data = X_df, Y_data = Y_df[['itm']], timesteps = 8,
+                input_projection = 'gated_fan', input_projection_width = 16, input_projection_dropout = 0.5,
+                model_relative_width = [32, 16, 2], model_dropout = [0.98, 0.98, 0.5],
+                data_storage_path = './models/')
+```
+
+Every bar of the window goes through a gated FAN layer (periodic + non-periodic components of the features), then through the usual LSTM stack.
 
 ---
 
