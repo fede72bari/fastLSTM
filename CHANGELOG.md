@@ -7,6 +7,8 @@ All notable changes to `fastLSTM` are documented here. The format follows
 ## [2.4.0] - 2026-10-04
 
 ### Added
+- `backend = 'jax'`: the network runs on JAX too (the backend to use on TPUs); `compute_gradients` /
+  `gradient_feature_importance` support it. Models are portable across TensorFlow, PyTorch and JAX.
 - `sample_weight`: one weight per row of `X_data`, applied to the training samples (each sample takes the weight
   of its first target row; the generators then yield `(X, Y, w)`). Cannot be combined with `class_weight`.
 - `monitor_auc` and `monitor_auc_rows`: ROC AUC of the validation predictions computed at the end of every epoch,

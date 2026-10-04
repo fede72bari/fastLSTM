@@ -152,7 +152,7 @@ import yfinance as yf
 # PyTorch. Keras fixes its backend when it is first imported, so it is NOT
 # imported here: it is loaded by the first instance created, with the backend
 # requested by its `backend` parameter (see load_keras).
-SUPPORTED_BACKENDS = ('tensorflow', 'torch')
+SUPPORTED_BACKENDS = ('tensorflow', 'torch', 'jax')
 
 
 def load_keras(backend = None):
@@ -165,7 +165,7 @@ def load_keras(backend = None):
 
     Parameters
     ----------
-    backend : {'tensorflow', 'torch'}, optional
+    backend : {'tensorflow', 'torch', 'jax'}, optional
         Backend to use. ``None`` keeps the active one, or, if Keras is not
         loaded yet, uses the ``KERAS_BACKEND`` environment variable
         (``'tensorflow'`` when it is not set).
@@ -921,8 +921,9 @@ class fastLSTM:
         split stays the first/last ``train_size_rate`` of the rows). Not
         stored in the saved files: pass it again after :meth:`load_all`
         (attribute ``sequence_groups``) before using the generators.
-    backend : {'tensorflow', 'torch'}, optional
-        Deep learning framework that runs the network (through Keras 3).
+    backend : {'tensorflow', 'torch', 'jax'}, optional
+        Deep learning framework that runs the network (through Keras 3):
+        ``'jax'`` is the one to use on TPUs (e.g. Kaggle TPU v5e-8).
         ``None`` (default) keeps the backend already active in the Python
         process, or uses the ``KERAS_BACKEND`` environment variable
         (``'tensorflow'`` when it is not set). The backend is fixed for the
@@ -982,7 +983,7 @@ class fastLSTM:
     Attributes
     ----------
     backend : str
-        Active Keras backend (``'tensorflow'`` or ``'torch'``).
+        Active Keras backend (``'tensorflow'``, ``'torch'`` or ``'jax'``).
     keras : module
         The Keras module used by the instance.
     model : keras.Sequential
@@ -2867,6 +2868,12 @@ class fastLSTM:
         # MSE is used for every network type (as in fastANN): only the gradient magnitude matters here
         mse = keras.losses.MeanSquaredError()
         targets = keras.ops.convert_to_tensor(np.asarray(targets, dtype = np.float32))
+
+        if(self.backend == 'jax'):
+            # JAX: gradient of a pure function of the inputs (the model weights are constants here)
+            import jax
+            inputs = jax.numpy.asarray(np.asarray(inputs, dtype = np.float32))
+            return np.asarray(jax.grad(lambda x: mse(targets, self.model(x)))(inputs))
 
         if(self.backend == 'torch'):
             # PyTorch autograd: the inputs become a leaf tensor that records its gradient
