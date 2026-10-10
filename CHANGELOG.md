@@ -4,6 +4,23 @@ All notable changes to `fastLSTM` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.4.1] - 2026-10-10
+
+### Added
+- `distribution_strategy`: a TensorFlow distribution strategy (e.g. `tf.distribute.MirroredStrategy()` for the two T4
+  GPUs of Kaggle). The network is built, compiled and loaded inside its scope, so `fit` trains on all its devices. Without
+  it TensorFlow uses one GPU even when more are visible.
+- `batch_multiple` and `effective_batch_multiple()`: with a Keras distribution (JAX `keras.distribution.DataParallel`,
+  e.g. the 8 cores of a TPU v5e-8) every batch of the generators is completed to a multiple of the number of devices by
+  repeating its last window; `generator.n_samples` keeps the number of real windows. Module function `pad_to_multiple()`.
+- `predict_validation()`: validation predictions cut back to the real windows; used by the AUC monitor and by
+  `network_predictions_evaluation`.
+- README: section "Training on several devices (two GPUs, TPU)".
+
+### Fixed
+- Multi-device training on TPU stopped with `IndivisibleError` at the last, partial batch of the first epoch (e.g. 335
+  windows on 8 cores).
+
 ## [2.4.0] - 2026-10-04
 
 ### Added

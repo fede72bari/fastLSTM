@@ -16,14 +16,15 @@ What it does for you:
 - **Training best practices built in** — early stopping, checkpoint of the best epoch (reloaded at the end), class weights, training-history plots.
 - **Reproducibility and model versioning** — every training run is saved as a self-describing, timestamped set of files (model, scalers, data, hyperparameters, history) and restored with one call (see [Model versioning](#model-versioning-runs-datasets-and-hyperparameters)).
 - **Evaluation and use** — classification reports per output, precision/recall vs probability cutoff, gradient-based feature importance, ready-to-use prediction on new data with automatic scaling/descaling.
-- **TensorFlow or PyTorch** — choose the framework when creating the instance (`backend = 'tensorflow'`, `'torch'` or `'jax'`); the same code, files and results work with both, and a model trained with one backend can be reloaded with the other.
+- **TensorFlow, PyTorch or JAX** — choose the framework when creating the instance (`backend = 'tensorflow'`, `'torch'` or `'jax'`); the same code, files and results work with all three, and a model trained with one backend can be reloaded with another.
+- **Several GPUs or a TPU** — the same run trains on the two GPUs of a Kaggle "GPU T4 x2" session (`distribution_strategy`) or on the 8 cores of a TPU v5e-8 (JAX data parallelism): the batches are completed automatically so that they split evenly among the devices (see [Training on several devices](#training-on-several-devices-two-gpus-tpu)).
 - **One workflow for two model families** — `fastLSTM` shares parameter names, method names and saved-file layout with its sister package [`fastANN`](https://github.com/fede72bari/fastANN) (dense networks): the same code pattern trains, saves and reloads both, so they can be compared on the same data.
 
 Typical uses: price/return forecasting, direction (up/down) classification, multi-horizon forecasts, any sequence-to-value problem on tabular time series.
 
 ---
 
-**Current version: 2.4.0** (`fastLSTM.__version__`) — see the [CHANGELOG](CHANGELOG.md).
+**Current version: 2.4.1** (`fastLSTM.__version__`) — see the [CHANGELOG](CHANGELOG.md).
 
 ## Contents
 
@@ -166,6 +167,48 @@ print(model.backend)                                               # 'torch'
 - **JAX for TPUs**: `backend = 'jax'` runs the same network on JAX, the backend to use on TPUs (e.g. Kaggle TPU v5e-8, Google Colab TPU). Models are portable across the three backends. On GPU prefer TensorFlow for LSTMs (cuDNN kernels).
 - `model.keras` is the Keras module in use; `model.model` is a regular Keras model on either backend.
 
+### Training on several devices (two GPUs, TPU)
+
+Data parallelism: every batch is split among the devices, each one computes the gradients of its share and the weights are updated with their average. Network, results and saved files are the same as on one device; only the time per epoch changes.
+
+**Two or more GPUs (TensorFlow, e.g. Kaggle "GPU T4 x2")**
+
+```python
+import tensorflow as tf
+
+strategy = tf.distribute.MirroredStrategy()          # all the visible GPUs
+lstm = fastLSTM(X_data = X_df, Y_data = Y_df, timesteps = 8, batch_size = 4096,
+                distribution_strategy = strategy, data_storage_path = './models/')
+lstm.network_structure_set_compile()                 # built and compiled inside strategy.scope()
+lstm.network_training(epochs = 100)                  # each GPU gets 4096 / 2 windows per step
+```
+
+- fastLSTM builds, compiles and reloads the network inside `strategy.scope()`. Entering the scope by hand (`strategy.scope().__enter__()` at the top of a script) is **not** enough with Keras 3: the variables would not be distributed and `fit` fails with ``colocate_vars_with must only be passed a variable created in this tf.distribute.Strategy.scope()``.
+- `batch_size` is the global batch, split among the GPUs (4096 on two GPUs = 2048 windows each per step). The same batch gives the same training as on one GPU and is faster when one GPU was saturated by the whole batch; a larger batch uses the GPUs better but changes the optimisation (fewer updates per epoch, learning rate to revise).
+- Without `distribution_strategy` TensorFlow trains on **one** GPU even when two are visible.
+
+**TPU (JAX, e.g. Kaggle TPU v5e-8, Google Colab TPU)**
+
+```python
+import os
+os.environ['KERAS_BACKEND'] = 'jax'
+import jax, keras
+
+keras.distribution.set_distribution(keras.distribution.DataParallel(devices = jax.devices()))   # 8 cores on a v5e-8
+lstm = fastLSTM(X_data = X_df, Y_data = Y_df, timesteps = 8, batch_size = 4096, backend = 'jax',
+                data_storage_path = './models/')
+lstm.network_structure_set_compile()
+lstm.network_training(epochs = 100)
+probabilities = lstm.predict_validation()            # one row per real validation window
+```
+
+- With a Keras distribution every batch must split evenly among the devices, otherwise JAX stops with `IndivisibleError` (typically on the last, partial batch of the epoch, e.g. 335 windows on 8 cores). fastLSTM completes each batch to a multiple of the number of devices by repeating its last window (`batch_multiple`, read from the active distribution: 8 on a v5e-8, 1 without distribution); `batch_size` must be a multiple of it. At most `n_devices - 1` copies of one window are added to the last batch of each epoch.
+- `predict_validation()` returns the validation predictions cut back to the real windows (`validation_generator.n_samples`); the AUC monitor and `network_predictions_evaluation` use it. Use it instead of `model.predict(validation_generator)`, which also returns the repeated windows.
+- A TPU can be opened by one process only: if the notebook calls `jax.devices()` and then trains in a subprocess, the subprocess finds the TPU busy. Train in the process that opened it, or open it only in the subprocess.
+- Colab TPU runtimes have no TensorFlow: use `backend = 'jax'` (models trained there reload with TensorFlow or PyTorch).
+
+**Which accelerator for LSTMs.** On GPU the LSTM layers run on the fused cuDNN kernel only with `activation = 'tanh'` (default), sigmoid recurrent activation, no recurrent dropout and no unrolling. fastLSTM keeps all of these conditions (dropout is a separate layer between the LSTMs, the `input_projection` comes before them), so change `activation` only knowingly: other activations fall back to the generic kernel, several times slower. On TPU the network is compiled by XLA and the activation does not change the kernel.
+
 ### Split and scaling
 
 - The split is always **sequential** (first `train_size_rate` of the rows for training, the rest for test) to avoid look-ahead.
@@ -227,6 +270,8 @@ print(model.backend)                                               # 'torch'
 | `sample_weight` | array-like | `None` | One weight per row of `X_data`: the training rows weight the loss (e.g. larger weights for the hard cases, such as options with the strike close to the underlying). Validation is not weighted. Not saved in the files (only whether it was used). |
 | `monitor_auc` | `bool` | `False` | Compute the ROC AUC of the validation predictions at the end of every epoch and log it as `val_monitored_auc` (binary targets). Use it as `early_stop_monitor_metric` / `checkpoint_monitor_metric` with mode `'max'` to choose the epoch on the AUC. One extra prediction pass on the validation set per epoch. |
 | `monitor_auc_rows` | array-like of `bool` | `None` | One value per row of `X_data`: the monitored AUC uses only the selected validation rows (e.g. strike within 2% of the underlying). Implies `monitor_auc = True`. Not saved in the files. |
+| `distribution_strategy` | `tf.distribute.Strategy` | `None` | TensorFlow only: the network is built, compiled and loaded inside its scope, so that `fit` trains on all its devices, e.g. `tf.distribute.MirroredStrategy()` for two GPUs (see [Training on several devices](#training-on-several-devices-two-gpus-tpu)). `None` = one device. |
+| `batch_multiple` | `int` | `None` | Every batch of the generators is completed to a multiple of it (the last partial batch repeats its last window). `None` uses the number of devices of the active Keras distribution (8 with `keras.distribution.DataParallel` on a TPU v5e-8) and 1 without distribution. `batch_size` must be a multiple of it. |
 | `history_metrics` | `list` of `str` | `None` | Columns plotted by `plot_training_history()`. `None` → `['loss', 'val_loss']` for regressors, first metric and its `val_` version for classificators. |
 
 ### Early stopping and checkpoint
@@ -260,7 +305,8 @@ Every method has a complete docstring: `help(fastLSTM.network_training)`.
 |---|---|
 | `network_structure_set_compile(timesteps=None)` | Builds the network (see [architecture](#network-architecture)) and compiles it with Adam, `loss` and `metrics`. `timesteps` optionally changes the sequence length. The text summary is kept in `model_summary`. |
 | `network_training(epochs, batch_size=None, timesteps=None, callbacks=None)` | Trains with early stopping and checkpointing (plus any extra Keras `callbacks`), saves every artefact (see [Saved files](#saved-files)), reloads the best epoch into `model` and plots the history. `timesteps` must match the built network. |
-| `create_generators(batch_size=None)` | (Re)creates `generator` (training) and `validation_generator` (test). Called automatically when needed. |
+| `create_generators(batch_size=None)` | (Re)creates `generator` (training) and `validation_generator` (test). Called automatically when needed. With several devices every batch is completed to `effective_batch_multiple()`; `generator.n_samples` is the number of real windows. |
+| `effective_batch_multiple()` | Multiple every batch is completed to: `batch_multiple`, else the number of devices of the active Keras distribution, else 1. |
 | `split_and_scale(scaler_fit=False)` | Sequential split of `X_data`/`Y_data` and scaling. `scaler_fit=True` fits the scalers (new data), `False` only applies them. Called by the constructor with `True`. |
 | `set_loss_function(loss)` | Changes the loss (recompile afterwards). |
 | `early_stop_patience_set(patience=None)` | Rebuilds the early stopping callback, optionally with a new patience. |
@@ -280,6 +326,7 @@ Every method has a complete docstring: `help(fastLSTM.network_training)`.
 
 | Method | Returns | Description |
 |---|---|---|
+| `predict_validation()` | array `(n_windows, n_outputs)` | Predictions on the validation set, one row per real window (the windows repeated for multi-device batches are removed). Aligned with `validation_targets()`. |
 | `prepare_input_sample(X, current_datetime_idx, apply_scaler=True)` | array `(1, timesteps, n_features)` | Sequence of the `timesteps` rows ending at position `current_datetime_idx` of `X`. The prediction refers to the following row(s). |
 | `model_predict(data, apply_scaler=True, descale_result=True)` | array `(n_samples, n_targets * steps_ahead)` | Predicts on 3D sequences `(n, timesteps, n_features)` or one 2D sequence. Scales the inputs and descales the outputs (if `scale_targets`). |
 | `output_column_names()` | `list` of `str` | Names of the prediction columns (`<target>_step_<k>` when `steps_ahead > 1`). |
@@ -501,6 +548,18 @@ lstm = fastLSTM(X_data = X_df, Y_data = Y_df[['itm']], timesteps = 8,
 
 Every bar of the window goes through a gated FAN layer (periodic + non-periodic components of the features), then through the usual LSTM stack.
 
+This is the hybrid gated FAN + LSTM network: there is no separate "fastHybrid" class. The hybrid is fastLSTM with `input_projection = 'gated_fan'`, so it inherits everything above (sequence groups, AUC epoch selection, sample weights, saved files, several GPUs or TPU). The FAN layer is the one of [fastGatedFourierAnalysisNetwork](https://github.com/fede72bari/fastGatedFourierAnalysisNetwork) and [fastANN](https://github.com/fede72bari/fastANN) (`hidden_layer_type = 'gated_fan'`): a model saved by one package loads in the others.
+
+### 10. Two GPUs on Kaggle, or a TPU
+
+```python
+import tensorflow as tf
+lstm = fastLSTM(X_data = X_df, Y_data = Y_df[['itm']], timesteps = 8, batch_size = 4096,
+                distribution_strategy = tf.distribute.MirroredStrategy(), data_storage_path = './models/')
+```
+
+On a TPU set the JAX backend and `keras.distribution.DataParallel` before creating the instance (see [Training on several devices](#training-on-several-devices-two-gpus-tpu)); nothing else changes.
+
 ---
 
 ## Backward compatibility
@@ -538,3 +597,4 @@ Same names and workflow; LSTM-specific: `LSTM_type`, `timesteps`, `steps_ahead`,
 - `shuffle = True` never mixes past and future: it only changes which windows share a batch. Keep it off if you need the exact behaviour of versions < 2.1.
 - `class_weight` with more than one output is applied by Keras to the argmax of each target row: a warning is shown.
 - Inside Jupyter the plots appear inline; in scripts call `matplotlib.pyplot.show()` after `plot_training_history()`.
+- Very high dropout (≥ 0.9) with `mixed_float16`: `Dropout(rate)` scales the kept units by `1 / (1 - rate)` (200 at 0.995) and float16 activations can overflow (NaN loss from the first epoch). Use float32 there.

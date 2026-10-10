@@ -29,7 +29,7 @@ Typical workflow
 >>> lstm.network_predictions_evaluation(min_probability = 0.5)
 """
 
-__version__ = '2.4.0'
+__version__ = '2.4.1'
 
 # ---------------------------------------------------------------------------
 #                              Libraries Import
@@ -46,6 +46,7 @@ import joblib
 import glob
 import csv
 import json
+import functools
 import os
 
 # Warnings (used to flag deprecated parameter names)
@@ -524,8 +525,52 @@ def make_auc_callback(keras, predict, y_true, rows_mask = None, name = 'val_moni
     return MonitoredAUC()
 
 
+def in_strategy_scope(method):
+    """
+    Run a method that creates Keras variables (model building, compiling,
+    loading) inside the scope of the TensorFlow distribution strategy given
+    as ``distribution_strategy`` (e.g. ``tf.distribute.MirroredStrategy()``
+    for several GPUs). Without a strategy the method runs unchanged.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        strategy = getattr(self, 'distribution_strategy', None)
+        if(strategy is None):
+            return method(self, *args, **kwargs)
+        with strategy.scope():
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+def pad_to_multiple(indices, multiple):
+    """
+    Complete a batch of sample indices to a multiple of ``multiple`` by repeating the last one.
+
+    Data-parallel training on ``multiple`` devices (e.g. the 8 cores of a TPU
+    v5e-8) splits every batch evenly among them, so a final partial batch of,
+    say, 335 samples fails on 8 devices.
+
+    Parameters
+    ----------
+    indices : numpy.ndarray
+        Indices of the samples of one batch.
+    multiple : int
+        Required multiple (1 = unchanged).
+
+    Returns
+    -------
+    numpy.ndarray
+        The indices, followed by ``(-len(indices)) % multiple`` copies of the
+        last one.
+    """
+    pad = (-len(indices)) % max(int(multiple), 1)
+    if(pad == 0 or len(indices) == 0):
+        return indices
+    return np.concatenate([indices, np.repeat(indices[-1:], pad, axis = 0)])
+
+
 def make_sequence_generator(keras, data, targets, length, batch_size, end_index = None, shuffle = False, seed = 42,
-                            sample_weights = None):
+                            sample_weights = None, batch_multiple = 1):
     """
     Batches of (sequence, target) samples for Keras, on any backend.
 
@@ -560,6 +605,13 @@ def make_sequence_generator(keras, data, targets, length, batch_size, end_index 
     sample_weights : array-like, optional
         One weight per row of ``data``: each sample gets the weight of its
         target row and the batches become ``(X_batch, Y_batch, w_batch)``.
+    batch_multiple : int, default 1
+        Every batch size is made a multiple of it: the last (partial) batch is
+        completed by repeating its last sample. Needed with data-parallel
+        distribution on several devices (e.g. 8 TPU cores), which splits each
+        batch evenly; at most ``batch_multiple - 1`` duplicate samples per
+        epoch. Predictions on the generator must be cut to
+        ``generator.n_samples`` rows.
 
     Returns
     -------
@@ -567,6 +619,7 @@ def make_sequence_generator(keras, data, targets, length, batch_size, end_index 
         Object with ``len(generator)`` batches; ``generator[i]`` returns
         ``(X_batch, Y_batch)`` (plus the weights, see ``sample_weights``)
         with ``X_batch`` of shape ``(batch, length, n_features)``.
+        ``generator.n_samples`` is the number of real samples.
 
     Raises
     ------
@@ -602,6 +655,7 @@ def make_sequence_generator(keras, data, targets, length, batch_size, end_index 
             if(index < 0):
                 index += len(self)
             rows = self.target_rows[index * batch_size:(index + 1) * batch_size]
+            rows = pad_to_multiple(rows, batch_multiple)
             # sample for target row r: the `length` rows before r, in chronological order
             X_batch = np.stack([data[row - length:row] for row in rows])
             if(weights is not None):
@@ -616,11 +670,12 @@ def make_sequence_generator(keras, data, targets, length, batch_size, end_index 
     generator = SequenceGenerator()
     # target row of each sample in serving order without shuffling (used to align predictions and actual targets)
     generator.sample_target_rows = np.arange(length, last_index + 1)
+    generator.n_samples = len(generator.sample_target_rows)
     return generator
 
 
 def make_grouped_sequence_generator(keras, data, targets, length, batch_size, groups, steps_ahead = 1,
-                                    shuffle = False, seed = 42, sample_weights = None):
+                                    shuffle = False, seed = 42, sample_weights = None, batch_multiple = 1):
     """
     Batches of (sequence, target) samples whose windows never cross groups.
 
@@ -659,6 +714,10 @@ def make_grouped_sequence_generator(keras, data, targets, length, batch_size, gr
         One weight per row of ``data``: each sample gets the weight of its
         first target row and the batches become ``(X_batch, Y_batch,
         w_batch)``.
+    batch_multiple : int, default 1
+        Every batch size is made a multiple of it (see
+        :func:`make_sequence_generator`); ``generator.n_samples`` is the
+        number of real samples.
 
     Returns
     -------
@@ -727,6 +786,7 @@ def make_grouped_sequence_generator(keras, data, targets, length, batch_size, gr
             if(index < 0):
                 index += len(self)
             samples = self.samples[index * batch_size:(index + 1) * batch_size]
+            samples = pad_to_multiple(samples, batch_multiple)
             # step-major targets: all targets of step 1, then all targets of step 2, ...
             Y_batch = targets[target_rows[samples]].reshape(len(samples), -1)
             if(weights is not None):
@@ -739,6 +799,7 @@ def make_grouped_sequence_generator(keras, data, targets, length, batch_size, gr
 
     generator = GroupedSequenceGenerator()
     generator.sample_target_rows = target_rows
+    generator.n_samples = len(target_rows)
     return generator
 
 
@@ -971,6 +1032,19 @@ class fastLSTM:
         validation samples whose (first) target row is ``True`` (e.g. strike
         within 2% of the underlying). Implies ``monitor_auc = True``. Not
         stored in the saved files (only whether it was used).
+    batch_multiple : int, optional
+        Every batch of the generators is completed to a multiple of it (the
+        last partial batch repeats its last sample). ``None`` (default) uses
+        the number of devices of the active Keras distribution (e.g. 8 with
+        ``keras.distribution.DataParallel`` on a TPU v5e-8) and 1 without
+        distribution. ``batch_size`` must be a multiple of it.
+    distribution_strategy : tf.distribute.Strategy, optional
+        TensorFlow backend only: the model is built, compiled and loaded
+        inside ``distribution_strategy.scope()``, so that ``fit`` trains it on
+        all the devices of the strategy, e.g.
+        ``tf.distribute.MirroredStrategy()`` for the two T4 GPUs of Kaggle
+        (every batch is split among the GPUs). ``None`` (default) uses one
+        device. With JAX use ``keras.distribution.DataParallel`` instead.
     **legacy_kwargs
         Old parameter names, still accepted for backward compatibility with
         a ``DeprecationWarning``: ``scaler`` (-> ``scaler_type``), ``metric``
@@ -1079,6 +1153,8 @@ class fastLSTM:
                  sample_weight = None,
                  monitor_auc = False,
                  monitor_auc_rows = None,
+                 batch_multiple = None,
+                 distribution_strategy = None,
                  backend = None,
                  **legacy_kwargs):
 
@@ -1136,6 +1212,8 @@ class fastLSTM:
         self.monitor_auc_rows = None if monitor_auc_rows is None else np.asarray(monitor_auc_rows, dtype = bool)
         # a rows mask implies the AUC monitor
         self.monitor_auc = bool(monitor_auc) or (self.monitor_auc_rows is not None)
+        self.batch_multiple = batch_multiple
+        self.distribution_strategy = distribution_strategy
         if((self.class_weight is not None) and (self.sample_weight is not None)):
             raise ValueError('Use class_weight or sample_weight, not both (fold the class weights into sample_weight).')
 
@@ -1644,6 +1722,7 @@ class fastLSTM:
         return self.model_checkpoint
 
 
+    @in_strategy_scope
     def network_structure_set_compile(self, timesteps = None):
         """
         Build and compile the network.
@@ -1870,16 +1949,22 @@ class fastLSTM:
         if(batch_size is not None):
             self.batch_size = batch_size
 
+        multiple = self.effective_batch_multiple()
+        if(self.batch_size % multiple != 0):
+            raise ValueError(f'batch_size {self.batch_size} must be a multiple of {multiple} (devices of the data-parallel distribution).')
+
         if(getattr(self, 'sequence_groups', None) is not None):
             # windows and targets inside each group (e.g. option contract), never across two groups
             self.generator = make_grouped_sequence_generator(self.keras, self.X_train_s, self.Y_train_s,
                                                              length = self.timesteps, batch_size = self.batch_size,
                                                              groups = self.groups_train, steps_ahead = self.steps_ahead,
                                                              shuffle = self.shuffle,
-                                                             sample_weights = getattr(self, 'sample_weight_train', None))
+                                                             sample_weights = getattr(self, 'sample_weight_train', None),
+                                                             batch_multiple = multiple)
             self.validation_generator = make_grouped_sequence_generator(self.keras, self.X_test_s, self.Y_test_s,
                                                                         length = self.timesteps, batch_size = self.batch_size,
-                                                                        groups = self.groups_test, steps_ahead = self.steps_ahead)
+                                                                        groups = self.groups_test, steps_ahead = self.steps_ahead,
+                                                                        batch_multiple = multiple)
             return
 
         # the last target row usable is the one that still has steps_ahead - 1 rows after it
@@ -1890,13 +1975,56 @@ class fastLSTM:
                                                  end_index = len(self.X_train_s) - self.steps_ahead,
                                                  batch_size = self.batch_size,
                                                  shuffle = self.shuffle,
-                                                 sample_weights = getattr(self, 'sample_weight_train', None))
+                                                 sample_weights = getattr(self, 'sample_weight_train', None),
+                                                 batch_multiple = multiple)
         self.validation_generator = make_sequence_generator(self.keras,
                                                             self.X_test_s,
                                                             self.make_multi_step_targets(self.Y_test_s),
                                                             length = self.timesteps,
                                                             end_index = len(self.X_test_s) - self.steps_ahead,
-                                                            batch_size = self.batch_size)
+                                                            batch_size = self.batch_size,
+                                                            batch_multiple = multiple)
+
+
+    def effective_batch_multiple(self):
+        """
+        Multiple that every batch size must have (see ``batch_multiple``).
+
+        Returns
+        -------
+        int
+            ``batch_multiple`` when set; otherwise the number of devices of
+            the active Keras distribution (``keras.distribution``), or 1.
+        """
+        if(getattr(self, 'batch_multiple', None)):
+            return int(self.batch_multiple)
+        try:
+            distribution = self.keras.distribution.distribution()
+        except Exception:
+            distribution = None
+        mesh = getattr(distribution, 'device_mesh', None)
+        if(mesh is None):
+            return 1
+        return max(int(np.size(mesh.devices)), 1)
+
+
+    def predict_validation(self):
+        """
+        Predictions on the validation samples, aligned with :meth:`validation_targets`.
+
+        Same as ``model.predict(validation_generator)``, cut to the real
+        samples: with ``batch_multiple > 1`` the last batch is completed with
+        repeated samples, whose predictions are dropped here.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape ``(n_samples, n_outputs)``.
+        """
+        if(self.validation_generator is None):
+            self.create_generators()
+        predictions = self.model.predict(self.validation_generator, verbose = 0)
+        return predictions[:self.validation_generator.n_samples]
 
 
     def auc_callbacks(self):
@@ -1919,7 +2047,7 @@ class fastLSTM:
         mask_test = getattr(self, 'monitor_auc_rows_test', None)
         mask = None if mask_test is None else mask_test[first_rows]
 
-        return [make_auc_callback(self.keras, lambda: self.model.predict(self.validation_generator, verbose = 0),
+        return [make_auc_callback(self.keras, self.predict_validation,
                                   self.validation_targets(), mask)]
 
 
@@ -2143,6 +2271,7 @@ class fastLSTM:
         print(f'Hyperparameters loaded.')
 
 
+    @in_strategy_scope
     def load_model(self, model_file_name = None, file_path_name = None):
         """
         Load a saved Keras model into ``self.model``.
@@ -2431,7 +2560,7 @@ class fastLSTM:
         self.create_generators()
 
         # Cut off predictions with low probability
-        predictions = self.model.predict(self.validation_generator)
+        predictions = self.predict_validation()
         predictions_df = pd.DataFrame(predictions.reshape(predictions.shape[0], -1))
         filtered_predictions_results_df = pd.DataFrame()
 
